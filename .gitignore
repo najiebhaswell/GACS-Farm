@@ -1,0 +1,25 @@
+# Runtime & config (generated per-VPS)
+manager/config.conf
+manager/log.txt
+manager/nginx/
+
+# Instances (created at runtime)
+instances/
+
+# GenieACS source (cloned via Services menu)
+source/stable/
+source/latest/
+
+# L2TP Manager (separate repo, not needed)
+source/L2TP-Manager/
+
+# GACS-Ubuntu-22.04 (only keep parameter/ folder)
+source/GACS-Ubuntu-22.04/*
+!source/GACS-Ubuntu-22.04/parameter/
+
+# System
+*.log
+*.swp
+*.swo
+*~
+.DS_Store

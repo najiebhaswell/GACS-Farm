@@ -1,0 +1,77 @@
+version: '3.8'
+
+services:
+  mongodb:
+    image: mongo:4.4
+    restart: always
+    volumes:
+      - mongo-data:/data/db
+    networks:
+      - genieacs-net
+
+  genieacs-cwmp:
+    build:
+      context: ../../stable
+      dockerfile: ../deploy/stable/Dockerfile
+    restart: always
+    environment:
+      - GENIEACS_MONGODB_CONNECTION_URL=mongodb://mongodb:27017/genieacs
+    ports:
+      - "7547:7547"
+    networks:
+      - genieacs-net
+    depends_on:
+      - mongodb
+    command: ./dist/bin/genieacs-cwmp
+
+  genieacs-nbi:
+    build:
+      context: ../../stable
+      dockerfile: ../deploy/stable/Dockerfile
+    restart: always
+    environment:
+      - GENIEACS_MONGODB_CONNECTION_URL=mongodb://mongodb:27017/genieacs
+    ports:
+      - "7557:7557"
+    networks:
+      - genieacs-net
+    depends_on:
+      - mongodb
+    command: ./dist/bin/genieacs-nbi
+
+  genieacs-fs:
+    build:
+      context: ../../stable
+      dockerfile: ../deploy/stable/Dockerfile
+    restart: always
+    environment:
+      - GENIEACS_MONGODB_CONNECTION_URL=mongodb://mongodb:27017/genieacs
+    ports:
+      - "7567:7567"
+    networks:
+      - genieacs-net
+    depends_on:
+      - mongodb
+    command: ./dist/bin/genieacs-fs
+
+  genieacs-ui:
+    build:
+      context: ../../stable
+      dockerfile: ../deploy/stable/Dockerfile
+    restart: always
+    environment:
+      - GENIEACS_MONGODB_CONNECTION_URL=mongodb://mongodb:27017/genieacs
+      - GENIEACS_UI_JWT_SECRET=super_secret_jwt_key_change_me
+    ports:
+      - "3000:3000"
+    networks:
+      - genieacs-net
+    depends_on:
+      - mongodb
+    command: ./dist/bin/genieacs-ui
+
+volumes:
+  mongo-data:
+
+networks:
+  genieacs-net:
