@@ -166,6 +166,15 @@ Script akan otomatis:
    `http://cwmp-<nama>.<domain-anda>`  
    atau IP internal sesuai topologi Anda (lihat output **Direct access** / summary install).
 
+### Tun pool per pelanggan (RADIUS / firewall)
+
+Setiap instance mendapat **subnet OpenVPN tun sendiri** dalam bentuk **`172.27.x.0/24`** (unik per instance pada VPS). Disimpan di **`instances/<nama>/.vpn_tun_pool`**.
+
+- **IP VPN MikroTik** (bukan IP ONU) berada di rentang itu — umumnya `.2` untuk klien pertama (`topology subnet`).
+- Di **RADIUS** atau firewall server pusat, Anda bisa **allow** traffic dari **`172.27.x.0/24`** untuk pelanggan/instance tersebut, tanpa mencampur dengan subnet ONU di lokasi.
+
+Instance yang dipasang **sebelum** fitur ini memakai default image **`10.8.0.0/24`** di dalam container; untuk menyamakan perilaku, sesuaikan manual `server` di `ovpn-data/server/server.conf`, kosongkan `ipp.txt`, lalu restart container OpenVPN.
+
 ---
 
 ## 📁 Struktur Direktori
@@ -184,6 +193,7 @@ Script akan otomatis:
 │       ├── docker-compose.yml
 │       ├── vpn.env              # Env OpenVPN (DNS publik acs-*, dll.)
 │       ├── ovpn-data/            # Data & profil OpenVPN server/client
+│       ├── .vpn_tun_pool        # Rentang tun per instance (172.27.x.0/24), untuk RADIUS
 │       └── .onu_subnet          # Subnet ONU (info)
 └── source/
     ├── deploy/

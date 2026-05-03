@@ -131,6 +131,33 @@ get_public_ip() {
   echo "N/A"
 }
 
+# Unique 172.27.x.0/24 per instance (OpenVPN tun pool) for RADIUS / NAS allowlists.
+# Isolated from DOCKER_SUBNET (10.x.y.0/24) and from customer ONU LANs.
+allocate_vpn_tun_pool() {
+  local used=() n collision try f line
+  shopt -s nullglob
+  for f in "$INSTANCES_DIR"/*/.vpn_tun_pool; do
+    [ ! -f "$f" ] && continue
+    line=$(head -1 "$f" 2>/dev/null)
+    if [[ "$line" =~ ^172\.27\.([0-9]+)\.0/24$ ]]; then
+      used+=("${BASH_REMATCH[1]}")
+    fi
+  done
+  shopt -u nullglob
+  for ((try = 0; try < 400; try++)); do
+    n=$((RANDOM % 254 + 1))
+    collision=0
+    for u in "${used[@]}"; do
+      [[ "$u" == "$n" ]] && { collision=1; break; }
+    done
+    [[ $collision -eq 1 ]] && continue
+    echo "172.27.${n}.0"
+    return 0
+  done
+  err "Tidak bisa alokasi subnet tun OpenVPN unik (172.27.x.0/24 penuh?)."
+  return 1
+}
+
 # ╔══════════════════════════════════════╗
 # ║    SERVICES INSTALL / UNINSTALL      ║
 # ╚══════════════════════════════════════╝
@@ -841,6 +868,12 @@ install_instance() {
     return
   fi
 
+  local VPN_POOL_BASE
+  VPN_POOL_BASE=$(allocate_vpn_tun_pool) || return
+  echo "${VPN_POOL_BASE}/24" > "$TARGET_DIR/.vpn_tun_pool"
+  info "OpenVPN tun pool (RADIUS/NAS allow): ${W}${VPN_POOL_BASE}/24${N}"
+  log_action "VPN" "tun pool ${VPN_POOL_BASE}/24 instance=$INSTANCE_NAME"
+
   PUBLIC_IP=$(get_public_ip)
   load_config
   if [ -n "$BASE_DOMAIN" ]; then
@@ -1006,9 +1039,13 @@ EOF
   docker exec ovpn-${INSTANCE_NAME} sed -i '/push "dhcp-option/d' /etc/openvpn/server/server.conf 2>/dev/null
   docker exec ovpn-${INSTANCE_NAME} sed -i '/push "block-outside-dns/d' /etc/openvpn/server/server.conf 2>/dev/null
   
+  # Unique tun /24 per instance (default image uses 10.8.0.0 — replace for RADIUS per-customer allow)
+  docker exec ovpn-${INSTANCE_NAME} sed -i "s|^server[[:space:]].*|server ${VPN_POOL_BASE} 255.255.255.0|" /etc/openvpn/server/server.conf 2>/dev/null
+  docker exec ovpn-${INSTANCE_NAME} sh -c ': > /etc/openvpn/server/ipp.txt' 2>/dev/null
+
   # Push docker subnet route to MikroTik so it can reach the CWMP container
   docker exec ovpn-${INSTANCE_NAME} sh -c "echo 'push \"route ${DOCKER_SUBNET}.0 255.255.255.0\"' >> /etc/openvpn/server/server.conf" 2>/dev/null
-  
+
   docker restart ovpn-${INSTANCE_NAME} >/dev/null
 
   # --- Parameter Restore ---
@@ -1058,7 +1095,8 @@ EOF
   echo -e "  ${C}OpenVPN Connection (Isolasi Cluster):${N}"
   echo -e "  ${D}Server IP${N} : ${W}$PUBLIC_IP${N}"
   echo -e "  ${D}Port${N}      : ${W}$PORT_OPENVPN (UDP)${N}"
-  echo -e "  ${D}ONU Subnet${N}: ${W}$ONU_SUBNET${N}"
+  echo -e "  ${D}Tun pool${N}   : ${W}${VPN_POOL_BASE}/24${N} ${D}(allow di RADIUS dari rentang ini; client MikroTik umumnya .2)${N}"
+  echo -e "  ${D}ONU Subnet${N}: ${W}$ONU_SUBNET${N} ${D}(bukan IP VPN)${N}"
   echo ""
   echo -e "  ${Y}Download Profile VPN (.ovpn) untuk MikroTik:${N}"
   echo -e "  ${W}$TARGET_DIR/ovpn-data/client.ovpn${N}"
