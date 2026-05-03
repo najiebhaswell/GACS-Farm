@@ -10,7 +10,7 @@ instances/
 source/stable/
 source/latest/
 
-# L2TP Manager (separate repo, not needed)
+# Optional external tooling (unused in tree)
 source/L2TP-Manager/
 
 # GACS-Ubuntu-22.04 (only keep parameter/ folder)

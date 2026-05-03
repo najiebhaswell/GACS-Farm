@@ -1,6 +1,6 @@
 # 🚜 GACS-Farm — GenieACS Multi-Instance Orchestrator
 
-CLI manager untuk deploy, monitor, dan manage **multi-instance GenieACS (TR-069 ACS)** pada satu VPS, dengan integrasi L2TP VPN untuk konektivitas ONU lokal.
+CLI manager untuk deploy, monitor, dan manage **multi-instance GenieACS (TR-069 ACS)** pada satu VPS, dengan **OpenVPN per instance (container)** agar MikroTik di lokasi bisa menjangkau subnet ONU dan ACS (TR-069).
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Platform](https://img.shields.io/badge/platform-Ubuntu%2022.04-orange.svg)
@@ -16,8 +16,8 @@ CLI manager untuk deploy, monitor, dan manage **multi-instance GenieACS (TR-069 
 | **Auto Port Allocation** | Port CWMP/NBI/FS/UI dialokasikan otomatis tanpa bentrok |
 | **Nginx Reverse Proxy** | Subdomain otomatis per instance (`acs-<nama>.domain.id`) |
 | **Wildcard SSL/HTTPS** | SSL via Let's Encrypt + Cloudflare DNS-01 challenge |
-| **L2TP VPN Integration** | Otomatis buat L2TP user per instance untuk koneksi MikroTik |
-| **ONU Route Management** | Auto routing subnet ONU agar ACS bisa summon/push perangkat |
+| **OpenVPN per instance** | Satu container OpenVPN per instance; profil `.ovpn` untuk import ke MikroTik |
+| **ONU Route Management** | Route subnet ONU di jembatan Docker + OpenVPN (`iroute` / `route`) agar CWMP menjangkau CPE |
 | **Parameter Restore** | Restore provisions, virtual params, presets, UI config dari preset |
 | **Version Support** | GenieACS Stable (v1.2) dan Latest (v1.3-dev) |
 | **Pause/Unpause** | Freeze instance tanpa menghentikan container |
@@ -27,40 +27,28 @@ CLI manager untuk deploy, monitor, dan manage **multi-instance GenieACS (TR-069 
 
 ## 🏗️ Arsitektur
 
+Setiap **instance** punya stack Docker sendiri: MongoDB, empat proses GenieACS, dan **satu container OpenVPN** (UDP, port host unik). MikroTik mengimpor **`instances/<nama>/ovpn-data/...` (.ovpn)**; tunnel membawa route ke subnet LAN/ONU yang Anda masukkan saat install. **Nginx** di host mem-proxy subdomain ke port UI/CWMP/NBI/FS di loopback.
+
 ```
-┌─────────────────────────────────────────────────────────┐
-│                        VPS (Cloud)                       │
-│                                                          │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐               │
-│  │ Instance1 │  │ Instance2 │  │ Instance3 │  ...         │
-│  │ GenieACS  │  │ GenieACS  │  │ GenieACS  │              │
-│  │ +MongoDB  │  │ +MongoDB  │  │ +MongoDB  │              │
-│  └────┬─────┘  └────┬─────┘  └────┬─────┘               │
-│       │              │              │                     │
-│  ┌────┴──────────────┴──────────────┴────┐               │
-│  │          Nginx Reverse Proxy          │               │
-│  │       (SSL/HTTPS + Subdomains)        │               │
-│  └───────────────────────────────────────┘               │
-│                       │                                   │
-│  ┌────────────────────┴──────────────────┐               │
-│  │           L2TP VPN Server             │               │
-│  │    172.16.101.1 (Server Gateway)      │               │
-│  └────────┬───────────┬─────────────────┘               │
-│           │           │                                   │
-└───────────┼───────────┼───────────────────────────────────┘
-            │           │
-     L2TP Tunnel   L2TP Tunnel
-            │           │
-   ┌────────┴──┐  ┌─────┴──────┐
-   │ MikroTik1 │  │ MikroTik2  │
-   │172.16.101.│  │172.16.101. │
-   │   10      │  │   11       │
-   └─────┬─────┘  └─────┬─────┘
-         │              │
-    ┌────┴────┐    ┌────┴────┐
-    │ONU/ONT  │    │ONU/ONT  │
-    │10.50.x.x│    │192.168.x│
-    └─────────┘    └─────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                         VPS (Cloud)                           │
+│  ┌────────────────┐  ┌────────────────┐                     │
+│  │   Instance A    │  │   Instance B    │   ...               │
+│  │ MongoDB         │  │ MongoDB         │                     │
+│  │ CWMP/NBI/FS/UI  │  │ CWMP/NBI/FS/UI  │                     │
+│  │ + OpenVPN :PORT │  │ + OpenVPN :PORT │  (per-instance UDP)│
+│  └────────┬────────┘  └────────┬────────┘                     │
+│           │                     │                              │
+│  ┌────────┴─────────────────────┴────────────────────────┐  │
+│  │              Nginx (reverse proxy + SSL)               │  │
+│  └──────────────────────────┬─────────────────────────────┘  │
+└─────────────────────────────┼────────────────────────────────┘
+                              │ Internet
+                    ┌─────────┴─────────┐
+                    │     MikroTik       │  ← OpenVPN client (.ovpn)
+                    └─────────┬─────────┘
+                              │
+                         ONU / LAN subnet
 ```
 
 ---
@@ -97,7 +85,7 @@ Ikuti urutan ini di dalam manager:
 ```
 ┌─ 3. Services & Settings
 │   ├─ 4. Setup GenieACS Source  ← Clone source stable/latest
-│   ├─ 2. Install Services      ← Install L2TP, Nginx, Certbot
+│   ├─ 2. Install Services      ← Install Nginx + Certbot
 │   └─ 1. Setup Domain & SSL    ← Konfigurasi domain + SSL
 │
 └─ 1. Manage Instance
@@ -126,7 +114,7 @@ sudo ./mostech-gacs.sh
 ║    GenieACS Multi-Instance Orchestrator  ║
 ╚══════════════════════════════════════════╝
 
-  Instances: 1  │  Domain: domain.id  │  SSL: Active  │  L2TP: Active  │  Docker: Active
+  Instances: 1  │  Domain: domain.id  │  SSL: Active  │  Docker: Active
 ──────────────────────────────────────────
   1. Manage Instance
   2. View Activity Log
@@ -140,12 +128,13 @@ sudo ./mostech-gacs.sh
   2. Monitor Resources
   3. Pause / Unpause
   4. Uninstall Instance
+  5. Update ONU Subnet
   0. Back
 ```
 
 ### [3] Services & Settings
 ```
-  L2TP: Active  │  Nginx: Active  │  Certbot: Ready
+  Nginx: Active  │  Certbot: Ready
   Domain: domain.id  │  SSL: Active
   Source Stable: Ready  │  Source Latest: Ready
 ──────────────────────────────────────────
@@ -161,37 +150,21 @@ Script akan otomatis:
 - Alokasi port unik (CWMP/NBI/FS/UI)
 - Build & start Docker containers
 - Generate Nginx proxy config
-- Buat L2TP VPN user + password
-- Prompt subnet ONU → auto route di VPS
+- Deploy container **OpenVPN** (port UDP unik) + sesuaikan route ke subnet ONU
+- Prompt subnet ONU → route di stack Docker (CWMP ↔ jaringan OpenVPN)
 - Prompt restore parameter preset
 - Tampilkan info koneksi lengkap + panduan MikroTik
 
 ---
 
-## 🔌 Konektivitas ONU via L2TP
+## 🔌 Konektivitas ONU via OpenVPN (container)
 
-### Konfigurasi MikroTik
-
-```routeros
-# 1. Buat L2TP Client
-/interface l2tp-client add name=l2tp-out1 connect-to=<IP_VPS> \
-  user=<username> password=<password> disabled=no
-
-# 2. Firewall: Allow L2TP forward (POSISI PALING ATAS!)
-/ip firewall filter add chain=forward in-interface=l2tp-out1 \
-  action=accept comment="Allow L2TP to LAN" place-before=0
-/ip firewall filter add chain=forward out-interface=l2tp-out1 \
-  action=accept comment="Allow LAN to L2TP" place-before=1
-
-# 3. JANGAN pakai masquerade di L2TP interface!
-```
-
-> **⚠️ Penting:** Rule L2TP harus di posisi **paling atas** di firewall forward chain, sebelum hotspot atau drop rules.
-
-### ACS URL di OLT
-```
-http://172.16.101.1:<PORT_CWMP>
-```
+1. Setelah install instance, ambil file **`instances/<nama-instance>/ovpn-data/`** (misalnya `clients/client.ovpn` — path persis ditampilkan di akhir wizard install).
+2. **Import** profil ke MikroTik ( atau client OpenVPN), hubungkan ke **IP publik VPS** dan **port UDP** yang dicetak di summary install.
+3. Pastikan **subnet ONU** yang Anda masukkan saat install sesuai LAN di belakang MikroTik; skrip mengatur route/`iroute` agar trafik ACS–ONU konsisten.
+4. **ACS URL** untuk CPE (OLT/profile TR-069): gunakan URL CWMP yang ditampilkan, misalnya dengan domain:
+   `http://cwmp-<nama>.<domain-anda>`  
+   atau IP internal sesuai topologi Anda (lihat output **Direct access** / summary install).
 
 ---
 
@@ -209,7 +182,9 @@ http://172.16.101.1:<PORT_CWMP>
 ├── instances/                   # Instance data (runtime)
 │   └── <instance>/
 │       ├── docker-compose.yml
-│       └── .onu_subnet          # ONU subnet info
+│       ├── vpn.env              # Env OpenVPN (DNS publik acs-*, dll.)
+│       ├── ovpn-data/            # Data & profil OpenVPN server/client
+│       └── .onu_subnet          # Subnet ONU (info)
 └── source/
     ├── deploy/
     │   ├── stable/Dockerfile
@@ -238,9 +213,8 @@ http://172.16.101.1:<PORT_CWMP>
 - **Root Required**: Script harus dijalankan sebagai root (`sudo`).
 - **Dependency Auto-Check**: Script otomatis cek Docker, Git, Curl saat startup.
 - **Parameter Restore**: Otomatis mendeteksi versi. Stable restore 4 collection (termasuk UI config), Latest hanya 3 (skip config karena UI v1.3 berbeda).
-- **Route Persistence**: ONU routes disimpan di `/etc/l2tp-onu-routes.conf` dan otomatis di-restore saat VPS reboot via cron.
+- **Route & VPN**: Routing ONU diarahkan lewat **jaringan bridge instance + OpenVPN** per instance.
 - **Periodic Inform**: Set interval 60 detik di OLT profile untuk near-realtime management.
-- **MikroTik Firewall**: Rule L2TP harus di posisi 0-1 (paling atas) di forward chain.
 
 ---
 

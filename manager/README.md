@@ -1,6 +1,6 @@
 # Mostech GACS Manager
 
-CLI interaktif untuk mendeploy, memonitor, dan mengelola **GenieACS (TR-069)** multi-instans dalam satu server, dilengkapi reverse proxy Nginx, SSL/HTTPS otomatis, dan L2TP VPN untuk konektivitas ONU lokal.
+CLI interaktif untuk mendeploy, memonitor, dan mengelola **GenieACS (TR-069)** multi-instans dalam satu server, dilengkapi reverse proxy Nginx, SSL/HTTPS otomatis, dan **OpenVPN per instance (Docker)** agar MikroTik menjangkau subnet ONU dan ACS.
 
 ---
 
@@ -19,10 +19,10 @@ sudo ./mostech-gacs.sh
 
 ### [1] Manage Instance
 Submenu untuk mengelola semua instance GenieACS:
-- **Install New Instance** — Deploy instance baru (Stable/Latest) dengan port acak, L2TP user otomatis, dan parameter restore.
+- **Install New Instance** — Deploy instance baru (Stable/Latest) dengan port acak, **container OpenVPN** + subnet ONU, dan opsi parameter restore.
 - **Monitor Resources** — Pantau CPU/RAM/Network per instance secara real-time via `docker stats`.
 - **Pause / Unpause** — Freeze atau unfreeze instance tanpa menghentikan container.
-- **Uninstall Instance** — Hapus total container, image, volume, konfigurasi Nginx, L2TP user, dan route.
+- **Uninstall Instance** — Hapus total container, image, volume, dan konfigurasi Nginx untuk instance tersebut.
 
 ### [2] View Activity Log
 Baca riwayat semua aksi dari `log.txt`. Mendukung filter dan pencarian kata kunci.
@@ -35,7 +35,7 @@ Submenu untuk konfigurasi infrastruktur:
   - **Cloudflare API Token:** Validasi otomatis (cek token aktif + akses zone)
   - **SSL/HTTPS:** Wildcard certificate `*.domain.id` via Let's Encrypt + Cloudflare DNS-01
 
-- **Install Services** — L2TP Server, Nginx Proxy, Certbot (atau Install All)
+- **Install Services** — Nginx Proxy, Certbot (atau Install All)
 
 - **Uninstall Services** — Hapus service yang terinstall
 
@@ -67,7 +67,7 @@ Submenu untuk konfigurasi infrastruktur:
 │       ├── nginx.conf
 │       ├── conf.d/             # Config per-instans (otomatis)
 │       └── ssl/                # Sertifikat Let's Encrypt
-├── instances/                  # Folder per-instans (otomatis)
+├── instances/                  # Folder per-instans: compose, vpn.env, ovpn-data/
 └── source/
     ├── deploy/                 # Dockerfiles
     ├── GACS-Ubuntu-22.04/

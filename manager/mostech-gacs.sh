@@ -3,7 +3,7 @@
 # MOSTECH GACS MANAGER v1.2
 # Multi-instance GenieACS orchestration tool with auto port allocation,
 # isolated databases, Nginx reverse proxy, wildcard SSL via Cloudflare,
-# and L2TP VPN integration for ONU-to-ACS connectivity.
+# and OpenVPN per instance (Docker) for site-to-ACS connectivity.
 # ==============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -18,17 +18,6 @@ NGINX_CONF_DIR="${NGINX_DIR}/conf.d"
 SSL_DIR="${NGINX_DIR}/ssl"
 VERSION_TAG="v1.2"
 PARAM_DIR="${SOURCE_DIR}/GACS-Ubuntu-22.04/parameter"
-ROUTES_FILE="/etc/l2tp-onu-routes.conf"
-
-# L2TP Configuration
-L2TP_CONFIG="/etc/xl2tpd/xl2tpd.conf"
-PPP_CONFIG="/etc/ppp/options.xl2tpd"
-CHAP_SECRETS="/etc/ppp/chap-secrets"
-L2TP_SUBNET="172.16.101.0/24"
-L2TP_LOCAL_IP="172.16.101.1"
-L2TP_IP_START=10
-L2TP_IP_END=100
-L2TP_IP_BASE="172.16.101"
 
 mkdir -p "$INSTANCES_DIR" "$NGINX_CONF_DIR" "$SSL_DIR"
 
@@ -63,29 +52,6 @@ check_dependencies() {
   fi
 }
 check_dependencies
-
-# --- Firewall Abstraction (iptables vs nftables) ---
-detect_firewall() {
-  if command -v iptables &>/dev/null; then
-    FW_CMD="iptables"
-    FW_SAVE="iptables-save"
-  elif command -v iptables-legacy &>/dev/null; then
-    FW_CMD="iptables-legacy"
-    FW_SAVE="iptables-legacy-save"
-  else
-    FW_CMD=""
-    FW_SAVE=""
-  fi
-}
-detect_firewall
-
-fw_add() { [ -n "$FW_CMD" ] && $FW_CMD "$@" 2>/dev/null; }
-fw_del() { [ -n "$FW_CMD" ] && $FW_CMD "$@" 2>/dev/null; }
-fw_save() {
-  [ -z "$FW_CMD" ] && return 0
-  mkdir -p /etc/iptables 2>/dev/null
-  $FW_SAVE > /etc/iptables/rules.v4 2>/dev/null
-}
 
 # --- Colors ---
 R='\033[0;31m'
@@ -156,380 +122,13 @@ generate_random_password() {
 }
 
 # ╔══════════════════════════════════════╗
-# ║      ONU ROUTE MANAGEMENT            ║
+# ║         NETWORK HELPERS              ║
 # ╚══════════════════════════════════════╝
-
-add_onu_route() {
-  local subnet="$1"
-  local via_ip="$2"
-  local instance="$3"
-
-  # Try to add route immediately (may fail if MikroTik not connected yet — this is normal)
-  if ip route show | grep -q "$subnet"; then
-    warn "Route $subnet already exists, updating persistent config."
-  else
-    ip route add "$subnet" via "$via_ip" 2>/dev/null
-    if [ $? -eq 0 ]; then
-      ok "Route added: ${W}$subnet${N} via ${W}$via_ip${N}"
-    else
-      # Gateway unreachable = MikroTik belum connect, route akan otomatis aktif via PPP hooks
-      ok "Route ${W}$subnet${N} via ${W}$via_ip${N} saved."
-      info "Route akan otomatis aktif saat MikroTik connect via L2TP."
-    fi
-  fi
-
-  # Remove existing entry for this instance to avoid duplicates
-  [ -f "$ROUTES_FILE" ] && sed -i "/^$instance /d" "$ROUTES_FILE"
-
-  # Save to persistent file
-  echo "$instance $subnet $via_ip" >> "$ROUTES_FILE"
-  # Save to instance dir
-  echo "$subnet" > "$INSTANCES_DIR/$instance/.onu_subnet"
-
-  # Ensure PPP hooks are installed for auto route on connect/disconnect
-  install_ppp_route_hooks
-
-  log_action "ROUTE" "Added: $subnet via $via_ip (instance: $instance)"
-}
-
-remove_onu_route() {
-  local instance="$1"
-  local subnet_file="$INSTANCES_DIR/$instance/.onu_subnet"
-
-  if [ -f "$subnet_file" ]; then
-    local subnet
-    subnet=$(cat "$subnet_file")
-    ip route del "$subnet" 2>/dev/null
-    ok "Route removed: ${W}$subnet${N}"
-
-    # Remove from persistent file
-    [ -f "$ROUTES_FILE" ] && sed -i "/^$instance /d" "$ROUTES_FILE"
-    rm -f "$subnet_file"
-    log_action "ROUTE" "Removed: $subnet (instance: $instance)"
-  fi
-}
-
-restore_onu_routes() {
-  # Called on system boot to re-add all ONU routes
-  if [ ! -f "$ROUTES_FILE" ]; then return; fi
-  while IFS=' ' read -r inst subnet via_ip; do
-    [[ -z "$inst" || "$inst" =~ ^# ]] && continue
-    if ! ip route show | grep -q "$subnet"; then
-      ip route add "$subnet" via "$via_ip" 2>/dev/null
-    fi
-  done < "$ROUTES_FILE"
-}
-
-install_ppp_route_hooks() {
-  # Install PPP ip-up/ip-down hooks for automatic ONU route management
-  # When MikroTik connects via L2TP → routes auto-added
-  # When MikroTik disconnects → routes auto-removed
-  local hook_up="/etc/ppp/ip-up.d/onu-routes"
-  local hook_down="/etc/ppp/ip-down.d/onu-routes"
-
-  mkdir -p /etc/ppp/ip-up.d /etc/ppp/ip-down.d
-
-  cat > "$hook_up" <<'HOOKEOF'
-#!/bin/bash
-# GACS-Farm: Auto-add ONU routes when L2TP/PPP session comes up
-# Called by pppd with args: interface tty speed local_ip remote_ip
-REMOTE_IP="$5"
-ROUTES_FILE="/etc/l2tp-onu-routes.conf"
-[ ! -f "$ROUTES_FILE" ] && exit 0
-while IFS=' ' read -r instance subnet via_ip; do
-    [[ -z "$instance" || "$instance" =~ ^# ]] && continue
-    if [ "$via_ip" == "$REMOTE_IP" ]; then
-        ip route replace "$subnet" via "$via_ip" 2>/dev/null
-        logger -t gacs-route "PPP up: added route $subnet via $via_ip (instance: $instance)"
-    fi
-done < "$ROUTES_FILE"
-exit 0
-HOOKEOF
-  chmod +x "$hook_up"
-
-  cat > "$hook_down" <<'HOOKEOF'
-#!/bin/bash
-# GACS-Farm: Auto-remove ONU routes when L2TP/PPP session goes down
-# Called by pppd with args: interface tty speed local_ip remote_ip
-REMOTE_IP="$5"
-ROUTES_FILE="/etc/l2tp-onu-routes.conf"
-[ ! -f "$ROUTES_FILE" ] && exit 0
-while IFS=' ' read -r instance subnet via_ip; do
-    [[ -z "$instance" || "$instance" =~ ^# ]] && continue
-    if [ "$via_ip" == "$REMOTE_IP" ]; then
-        ip route del "$subnet" via "$via_ip" 2>/dev/null
-        logger -t gacs-route "PPP down: removed route $subnet via $via_ip (instance: $instance)"
-    fi
-done < "$ROUTES_FILE"
-exit 0
-HOOKEOF
-  chmod +x "$hook_down"
-}
-
-setup_route_persistence() {
-  # Install PPP hooks for automatic route management on connect/disconnect
-  install_ppp_route_hooks
-
-  # Add @reboot cron as fallback to restore routes after reboot
-  local cron_cmd="@reboot sleep 30 && [ -f $ROUTES_FILE ] && while IFS=' ' read -r i s v; do ip route add \$s via \$v 2>/dev/null; done < $ROUTES_FILE"
-  if ! crontab -l 2>/dev/null | grep -q "l2tp-onu-routes"; then
-    (crontab -l 2>/dev/null; echo "$cron_cmd # l2tp-onu-routes") | crontab -
-  fi
-  ok "Route persistence enabled (PPP hooks + cron @reboot)."
-}
-
-# ╔══════════════════════════════════════╗
-# ║         L2TP FUNCTIONS               ║
-# ╚══════════════════════════════════════╝
-
-check_l2tp_installed() {
-  if dpkg -l xl2tpd 2>/dev/null | grep -q "^ii" && \
-     [ -f "$L2TP_CONFIG" ] && \
-     systemctl is-enabled xl2tpd >/dev/null 2>&1; then
-    return 0
-  fi
-  return 1
-}
 
 get_public_ip() {
   curl -s -4 --max-time 5 ifconfig.me 2>/dev/null || \
   curl -s -4 --max-time 5 icanhazip.com 2>/dev/null || \
   echo "N/A"
-}
-
-get_default_interface() {
-  ip route | grep default | awk '{print $5}' | head -n1
-}
-
-get_next_l2tp_ip() {
-  local assigned_ips=()
-  if [ -f "$CHAP_SECRETS" ]; then
-    while IFS= read -r line; do
-      [[ $line =~ ^#.*$ ]] || [[ -z $line ]] && continue
-      local ip=$(echo "$line" | awk '{print $4}')
-      [[ -n "$ip" ]] && assigned_ips+=("$ip")
-    done < "$CHAP_SECRETS"
-  fi
-
-  for i in $(seq $L2TP_IP_START $L2TP_IP_END); do
-    local test_ip="${L2TP_IP_BASE}.${i}"
-    local found=0
-    for aip in "${assigned_ips[@]}"; do
-      [[ "$aip" == "$test_ip" ]] && { found=1; break; }
-    done
-    if [ $found -eq 0 ]; then
-      echo "$test_ip"
-      return 0
-    fi
-  done
-  return 1
-}
-
-l2tp_user_exists() {
-  grep -q "^$1\s" "$CHAP_SECRETS" 2>/dev/null
-}
-
-create_l2tp_user() {
-  local username="$1"
-  local password="$2"
-  local ip_addr="$3"
-
-  if ! check_l2tp_installed; then
-    return 1
-  fi
-
-  if l2tp_user_exists "$username"; then
-    warn "L2TP user '$username' sudah ada, skip."
-    return 0
-  fi
-
-  printf "%-20s *       %-20s %s\n" "$username" "$password" "$ip_addr" >> "$CHAP_SECRETS"
-  systemctl restart xl2tpd >/dev/null 2>&1
-  log_action "L2TP" "User '$username' created (IP: $ip_addr)"
-  return 0
-}
-
-delete_l2tp_user() {
-  local username="$1"
-
-  if ! [ -f "$CHAP_SECRETS" ]; then return 1; fi
-  if ! l2tp_user_exists "$username"; then return 0; fi
-
-  sed -i "/^$username\s/d" "$CHAP_SECRETS"
-  systemctl restart xl2tpd >/dev/null 2>&1
-  log_action "L2TP" "User '$username' deleted"
-  return 0
-}
-
-install_l2tp_server() {
-  header "INSTALL L2TP SERVER"
-
-  if check_l2tp_installed; then
-    ok "L2TP server sudah terinstall."
-    return 0
-  fi
-
-  local PUBLIC_IP=$(get_public_ip)
-  local DEFAULT_INTERFACE=$(get_default_interface)
-
-  if [ -z "$DEFAULT_INTERFACE" ]; then
-    err "Cannot detect default network interface!"
-    return 1
-  fi
-
-  info "Public IP: ${W}$PUBLIC_IP${N}"
-  info "Interface: ${W}$DEFAULT_INTERFACE${N}"
-
-  # Step 1: Install packages
-  step "[1/5] Installing packages..."
-  DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1
-  # Core packages
-  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq xl2tpd ppp socat curl >/dev/null 2>&1
-  # Firewall persistence (may fail on some distros, non-fatal)
-  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iptables-persistent >/dev/null 2>&1 || \
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq netfilter-persistent >/dev/null 2>&1 || \
-    warn "iptables-persistent not available, firewall rules may not persist after reboot."
-  # Ensure iptables command is available (for nftables-based distros)
-  if ! command -v iptables &>/dev/null && ! command -v iptables-legacy &>/dev/null; then
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iptables >/dev/null 2>&1
-  fi
-  detect_firewall
-  if [ $? -ne 0 ] || ! dpkg -l xl2tpd 2>/dev/null | grep -q "^ii"; then
-    err "Package installation failed!"; return 1
-  fi
-  ok "Packages installed."
-
-  # Step 2: Configure xl2tpd
-  step "[2/5] Configuring L2TP server..."
-  [ -f "$L2TP_CONFIG" ] && cp "$L2TP_CONFIG" "${L2TP_CONFIG}.backup"
-  cat > "$L2TP_CONFIG" <<EOF
-[global]
-port = 1701
-access control = no
-
-[lns default]
-ip range = ${L2TP_IP_BASE}.${L2TP_IP_START}-${L2TP_IP_BASE}.${L2TP_IP_END}
-local ip = ${L2TP_LOCAL_IP}
-require chap = yes
-refuse pap = yes
-require authentication = yes
-name = L2TPServer
-ppp debug = yes
-pppoptfile = $PPP_CONFIG
-length bit = yes
-EOF
-
-  cat > "$PPP_CONFIG" <<EOF
-ipcp-accept-local
-ipcp-accept-remote
-ms-dns 8.8.8.8
-ms-dns 8.8.4.4
-noccp
-auth
-mtu 1410
-mru 1410
-nodefaultroute
-debug
-proxyarp
-require-chap
-refuse-pap
-EOF
-
-  if [ ! -f "$CHAP_SECRETS" ]; then
-    cat > "$CHAP_SECRETS" <<EOF
-# Secrets for authentication using CHAP
-# client        server  secret                  IP addresses
-EOF
-  fi
-  ok "L2TP configured."
-
-  # Step 3: Firewall
-  step "[3/5] Configuring firewall..."
-  grep -q "net.ipv4.ip_forward=1" /etc/sysctl.conf 2>/dev/null || echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
-  sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
-  sysctl -p >/dev/null 2>&1
-  fw_add -t nat -A POSTROUTING -s $L2TP_SUBNET -o "$DEFAULT_INTERFACE" -j MASQUERADE
-  fw_add -A FORWARD -s $L2TP_SUBNET -j ACCEPT
-  fw_add -A FORWARD -d $L2TP_SUBNET -j ACCEPT
-  fw_add -A INPUT -p udp --dport 1701 -j ACCEPT
-  fw_save
-  ok "Firewall configured."
-
-  # Step 4: Start services
-  step "[4/5] Starting L2TP service..."
-  systemctl enable xl2tpd >/dev/null 2>&1
-  systemctl start xl2tpd >/dev/null 2>&1
-  sleep 2
-  if systemctl is-active --quiet xl2tpd; then
-    ok "xl2tpd running."
-  else
-    warn "xl2tpd may need manual check."
-  fi
-
-  # Step 5: Enable persistence
-  step "[5/5] Enabling persistence..."
-  systemctl enable netfilter-persistent >/dev/null 2>&1 || \
-    systemctl enable iptables >/dev/null 2>&1 || true
-  # Install PPP hooks for automatic ONU route management
-  install_ppp_route_hooks
-  ok "Done."
-
-  log_action "L2TP" "L2TP server installed (IP: $PUBLIC_IP, IF: $DEFAULT_INTERFACE)"
-  echo ""
-  ok "L2TP Server installed! Listening on ${W}$PUBLIC_IP:1701${N}"
-  info "VPN Subnet: ${W}$L2TP_SUBNET${N} | Local IP: ${W}$L2TP_LOCAL_IP${N}"
-}
-
-uninstall_l2tp_server() {
-  header "UNINSTALL L2TP SERVER"
-
-  if ! check_l2tp_installed; then
-    info "L2TP server belum terinstall."
-    return 0
-  fi
-
-  warn "Ini akan menghapus L2TP server dan semua user VPN!"
-  read -p "$(echo -e "${R}✘${N} Ketik ${W}UNINSTALL${N} untuk konfirmasi: ")" CONFIRM
-  if [ "$CONFIRM" != "UNINSTALL" ]; then
-    warn "Cancelled."; return 0
-  fi
-
-  local DEFAULT_INTERFACE=$(get_default_interface)
-
-  step "Stopping services..."
-  systemctl stop xl2tpd 2>/dev/null
-  systemctl disable xl2tpd 2>/dev/null
-
-  step "Removing firewall rules..."
-  fw_del -D INPUT -p udp --dport 1701 -j ACCEPT
-  fw_del -D FORWARD -s $L2TP_SUBNET -j ACCEPT
-  fw_del -D FORWARD -d $L2TP_SUBNET -j ACCEPT
-  fw_del -t nat -D POSTROUTING -s $L2TP_SUBNET -o "$DEFAULT_INTERFACE" -j MASQUERADE
-  fw_save
-
-  step "Cleaning config files..."
-  rm -f "$PPP_CONFIG"
-  [ -f "$L2TP_CONFIG" ] && echo "" > "$L2TP_CONFIG"
-  [ -f "$CHAP_SECRETS" ] && {
-    echo "# Secrets for authentication using CHAP" > "$CHAP_SECRETS"
-    echo "# client        server  secret                  IP addresses" >> "$CHAP_SECRETS"
-  }
-
-  read -p "$(echo -e "${Y}?${N} Hapus packages juga? (xl2tpd, ppp, socat) (y/n): ")" RM_PKG
-  if [[ "$RM_PKG" == "y" || "$RM_PKG" == "Y" ]]; then
-    step "Removing packages..."
-    apt-get remove --purge -y xl2tpd ppp socat >/dev/null 2>&1
-    apt-get autoremove -y >/dev/null 2>&1
-    ok "Packages removed."
-  fi
-
-  pkill -9 pppd 2>/dev/null
-  for iface in $(ip link show 2>/dev/null | grep "ppp" | cut -d: -f2 | tr -d ' '); do
-    ip link delete "$iface" 2>/dev/null
-  done
-
-  log_action "L2TP" "L2TP server uninstalled"
-  ok "L2TP server removed."
 }
 
 # ╔══════════════════════════════════════╗
@@ -612,9 +211,7 @@ uninstall_nginx_service() {
 services_install_menu() {
   header "INSTALL SERVICES"
 
-  local l2tp_status nginx_status certbot_status
-
-  check_l2tp_installed && l2tp_status="${G}Installed${N}" || l2tp_status="${D}Not installed${N}"
+  local nginx_status certbot_status
 
   docker ps -q -f name=mostech-nginx-proxy >/dev/null 2>&1 && \
     [ -n "$(docker ps -q -f name=mostech-nginx-proxy)" ] && \
@@ -624,20 +221,17 @@ services_install_menu() {
     certbot_status="${G}Ready${N}" || certbot_status="${D}Not installed${N}"
 
   echo ""
-  echo -e "  ${W}1.${N} L2TP Server      [$l2tp_status]"
-  echo -e "  ${W}2.${N} Nginx Proxy      [$nginx_status]"
-  echo -e "  ${W}3.${N} Certbot (SSL)    [$certbot_status]"
-  echo -e "  ${W}4.${N} Install All"
+  echo -e "  ${W}1.${N} Nginx Proxy      [$nginx_status]"
+  echo -e "  ${W}2.${N} Certbot (SSL)    [$certbot_status]"
+  echo -e "  ${W}3.${N} Install All"
   echo -e "  ${W}0.${N} Back"
   divider
   read -p "$(echo -e "${B}►${N} Pilihan: ")" SVC_CHOICE
 
   case $SVC_CHOICE in
-    1) install_l2tp_server ;;
-    2) install_nginx_service ;;
-    3) install_certbot ;;
-    4)
-      install_l2tp_server
+    1) install_nginx_service ;;
+    2) install_certbot ;;
+    3)
       install_nginx_service
       install_certbot
       echo ""
@@ -651,9 +245,7 @@ services_install_menu() {
 services_uninstall_menu() {
   header "UNINSTALL SERVICES"
 
-  local l2tp_status nginx_status certbot_status
-
-  check_l2tp_installed && l2tp_status="${G}Installed${N}" || l2tp_status="${D}Not installed${N}"
+  local nginx_status certbot_status
 
   [ -n "$(docker ps -q -f name=mostech-nginx-proxy 2>/dev/null)" ] && \
     nginx_status="${G}Running${N}" || nginx_status="${D}Not running${N}"
@@ -662,20 +254,17 @@ services_uninstall_menu() {
     certbot_status="${G}Installed${N}" || certbot_status="${D}Not installed${N}"
 
   echo ""
-  echo -e "  ${W}1.${N} L2TP Server      [$l2tp_status]"
-  echo -e "  ${W}2.${N} Nginx Proxy      [$nginx_status]"
-  echo -e "  ${W}3.${N} Certbot (SSL)    [$certbot_status]"
-  echo -e "  ${W}4.${N} Uninstall All"
+  echo -e "  ${W}1.${N} Nginx Proxy      [$nginx_status]"
+  echo -e "  ${W}2.${N} Certbot (SSL)    [$certbot_status]"
+  echo -e "  ${W}3.${N} Uninstall All"
   echo -e "  ${W}0.${N} Back"
   divider
   read -p "$(echo -e "${B}►${N} Pilihan: ")" SVC_CHOICE
 
   case $SVC_CHOICE in
-    1) uninstall_l2tp_server ;;
-    2) uninstall_nginx_service ;;
-    3) uninstall_certbot ;;
-    4)
-      uninstall_l2tp_server
+    1) uninstall_nginx_service ;;
+    2) uninstall_certbot ;;
+    3)
       uninstall_nginx_service
       uninstall_certbot
       echo ""
@@ -1236,13 +825,59 @@ install_instance() {
   PORT_NBI=$(get_random_free_port)
   PORT_FS=$(get_random_free_port)
   PORT_UI=$(get_random_free_port)
-  ok "Ports: CWMP=${W}$PORT_CWMP${N} | NBI=${W}$PORT_NBI${N} | FS=${W}$PORT_FS${N} | UI=${W}$PORT_UI${N}"
+  PORT_OPENVPN=$(get_random_free_port)
+  DOCKER_SUBNET="10.$((RANDOM % 200 + 10)).$((RANDOM % 250))"
+  ok "Ports: CWMP=${W}$PORT_CWMP${N} | NBI=${W}$PORT_NBI${N} | FS=${W}$PORT_FS${N} | UI=${W}$PORT_UI${N} | VPN=${W}$PORT_OPENVPN${N}"
 
   TARGET_DIR="$INSTANCES_DIR/$INSTANCE_NAME"
   mkdir -p "$TARGET_DIR"
 
+  # --- ONU Subnet Route ---
+  echo ""
+  info "Agar ACS bisa manage ONU (summon/push), perlu route ke subnet ONU."
+  read -p "$(echo -e "${B}►${N} Subnet ONU di MikroTik ini (contoh: 10.50.0.0/16): ")" ONU_SUBNET
+  if [[ ! "$ONU_SUBNET" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]]; then
+    err "Format subnet tidak valid! Contoh: 10.50.0.0/16"
+    return
+  fi
+
+  PUBLIC_IP=$(get_public_ip)
+  load_config
+  if [ -n "$BASE_DOMAIN" ]; then
+    cat > "$TARGET_DIR/vpn.env" <<EOF
+VPN_DNS_NAME=acs-${INSTANCE_NAME}.${BASE_DOMAIN}
+VPN_PORT=${PORT_OPENVPN}
+VPN_PROTO=udp
+EOF
+  else
+    cat > "$TARGET_DIR/vpn.env" <<EOF
+VPN_PORT=${PORT_OPENVPN}
+VPN_PROTO=udp
+EOF
+  fi
+
   cat > "$TARGET_DIR/docker-compose.yml" <<EOF
 services:
+  openvpn:
+    image: hwdsl2/openvpn-server
+    container_name: ovpn-${INSTANCE_NAME}
+    restart: always
+    ports:
+      - "${PORT_OPENVPN}:${PORT_OPENVPN}/udp"
+    volumes:
+      - ./ovpn-data:/etc/openvpn
+      - ./vpn.env:/vpn.env:ro
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      - net.ipv4.ip_forward=1
+      - net.ipv6.conf.all.forwarding=1
+    networks:
+      genieacs-net:
+        ipv4_address: ${DOCKER_SUBNET}.254
+
   mongodb:
     image: mongo:4.4
     restart: always
@@ -1261,10 +896,13 @@ services:
     ports:
       - "${PORT_CWMP}:7547"
     networks:
-      - genieacs-net
+      genieacs-net:
+        ipv4_address: ${DOCKER_SUBNET}.100
     depends_on:
       - mongodb
-    command: ./dist/bin/genieacs-cwmp
+    cap_add:
+      - NET_ADMIN
+    command: sh -c "ip route add ${ONU_SUBNET} via ${DOCKER_SUBNET}.254 && ./dist/bin/genieacs-cwmp"
 
   genieacs-nbi:
     build:
@@ -1317,51 +955,77 @@ volumes:
 
 networks:
   genieacs-net:
+    ipam:
+      config:
+        - subnet: ${DOCKER_SUBNET}.0/24
 EOF
 
   step "Building & starting containers..."
-  log_action "INSTALL" "START - '$INSTANCE_NAME' ver=$VERSION | CWMP=$PORT_CWMP NBI=$PORT_NBI FS=$PORT_FS UI=$PORT_UI"
+  log_action "INSTALL" "START - '$INSTANCE_NAME' ver=$VERSION | CWMP=$PORT_CWMP NBI=$PORT_NBI FS=$PORT_FS UI=$PORT_UI OVPN=$PORT_OPENVPN"
   (cd "$TARGET_DIR" && $DOCKER_COMPOSE up -d --build)
 
   generate_nginx_conf "$INSTANCE_NAME" "$PORT_UI" "$PORT_CWMP" "$PORT_NBI" "$PORT_FS"
 
-  # --- L2TP Auto User Creation ---
-  local L2TP_USER_PASS="" L2TP_USER_IP="" ONU_SUBNET=""
-  if check_l2tp_installed; then
-    step "Creating L2TP user for this instance..."
-    L2TP_USER_PASS=$(generate_random_password 12)
-    L2TP_USER_IP=$(get_next_l2tp_ip)
-
-    if [ -n "$L2TP_USER_IP" ]; then
-      create_l2tp_user "$INSTANCE_NAME" "$L2TP_USER_PASS" "$L2TP_USER_IP"
-      ok "L2TP user '${W}$INSTANCE_NAME${N}' created."
-
-      # --- ONU Subnet Route ---
-      echo ""
-      info "Agar ACS bisa manage ONU (summon/push), perlu route ke subnet ONU."
-      read -p "$(echo -e "${B}►${N} Subnet ONU di MikroTik ini (contoh: 10.50.0.0/16): ")" ONU_SUBNET
-      if [[ -n "$ONU_SUBNET" && "$ONU_SUBNET" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]]; then
-        add_onu_route "$ONU_SUBNET" "$L2TP_USER_IP" "$INSTANCE_NAME"
-        setup_route_persistence
-      elif [ -n "$ONU_SUBNET" ]; then
-        err "Format subnet tidak valid! Contoh: 10.50.0.0/16"
-        info "Anda bisa tambahkan manual nanti: ip route add <subnet> via $L2TP_USER_IP"
-      else
-        info "Skipped. Tambahkan manual nanti jika diperlukan."
-      fi
+  step "Configuring OpenVPN Client routing (iroute)..."
+  sleep 5
+  local CIDR=$(echo "$ONU_SUBNET" | cut -d/ -f2)
+  local SUBNET_IP=$(echo "$ONU_SUBNET" | cut -d/ -f1)
+  
+  local full_octets=$((CIDR/8))
+  local partial_octet=$((CIDR%8))
+  local NETMASK=""
+  for ((i=0;i<4;i+=1)); do
+    if [ $i -lt $full_octets ]; then
+      NETMASK+="255"
+    elif [ $i -eq $full_octets ]; then
+      NETMASK+=$((256 - 2**(8-partial_octet)))
     else
-      warn "No available L2TP IPs. Skipped."
+      NETMASK+="0"
     fi
-  fi
+    test $i -lt 3 && NETMASK+="."
+  done
+
+  docker exec ovpn-${INSTANCE_NAME} sh -c "mkdir -p /etc/openvpn/ccd" 2>/dev/null
+  docker exec ovpn-${INSTANCE_NAME} sh -c "echo 'iroute $SUBNET_IP $NETMASK' > /etc/openvpn/ccd/client" 2>/dev/null
+  docker exec ovpn-${INSTANCE_NAME} sh -c "grep -q 'client-config-dir' /etc/openvpn/server/server.conf || echo 'client-config-dir /etc/openvpn/ccd' >> /etc/openvpn/server/server.conf" 2>/dev/null
+  docker exec ovpn-${INSTANCE_NAME} sh -c "grep -q 'route $SUBNET_IP' /etc/openvpn/server/server.conf || echo 'route $SUBNET_IP $NETMASK' >> /etc/openvpn/server/server.conf" 2>/dev/null
+  
+  # Fix MikroTik compatibility: disable tls-crypt entirely to prevent auth digest errors
+  docker exec ovpn-${INSTANCE_NAME} sed -i '/tls-crypt tc.key/d' /etc/openvpn/server/server.conf 2>/dev/null
+  docker exec ovpn-${INSTANCE_NAME} sed -i -e '/<tls-crypt>/,/<\/tls-crypt>/d' /etc/openvpn/clients/client.ovpn 2>/dev/null
+  docker exec ovpn-${INSTANCE_NAME} sed -i '/ignore-unknown-option/d' /etc/openvpn/clients/client.ovpn 2>/dev/null
+  
+  # Fix MikroTik null-digest error by switching AEAD cipher (GCM) to CBC
+  docker exec ovpn-${INSTANCE_NAME} sed -i 's/cipher AES-128-GCM/cipher AES-256-CBC\ndata-ciphers AES-256-CBC/g' /etc/openvpn/server/server.conf 2>/dev/null
+  docker exec ovpn-${INSTANCE_NAME} sed -i 's/cipher AES-128-GCM/cipher AES-256-CBC/g' /etc/openvpn/clients/client.ovpn 2>/dev/null
+  
+  # Remove unsupported push options that cause MikroTik to fail getting IP
+  docker exec ovpn-${INSTANCE_NAME} sed -i '/push "redirect-gateway/d' /etc/openvpn/server/server.conf 2>/dev/null
+  docker exec ovpn-${INSTANCE_NAME} sed -i '/push "block-ipv6/d' /etc/openvpn/server/server.conf 2>/dev/null
+  docker exec ovpn-${INSTANCE_NAME} sed -i '/push "ifconfig-ipv6/d' /etc/openvpn/server/server.conf 2>/dev/null
+  docker exec ovpn-${INSTANCE_NAME} sed -i '/push "dhcp-option/d' /etc/openvpn/server/server.conf 2>/dev/null
+  docker exec ovpn-${INSTANCE_NAME} sed -i '/push "block-outside-dns/d' /etc/openvpn/server/server.conf 2>/dev/null
+  
+  # Push docker subnet route to MikroTik so it can reach the CWMP container
+  docker exec ovpn-${INSTANCE_NAME} sh -c "echo 'push \"route ${DOCKER_SUBNET}.0 255.255.255.0\"' >> /etc/openvpn/server/server.conf" 2>/dev/null
+  
+  docker restart ovpn-${INSTANCE_NAME} >/dev/null
 
   # --- Parameter Restore ---
-  local ACS_URL="http://${L2TP_LOCAL_IP}:${PORT_CWMP}"
+  # For parameter restore, ACS URL that the ONU reaches is the CWMP Docker Container IP in its network, 
+  # or simply the public domain if NGINX is used. But Mikrotik via OpenVPN will likely reach the CWMP via DOCKER_SUBNET.x
+  # Let's set it to the CWMP container's internal IP or just the NGINX domain if domain is set.
+  load_config
+  local ACS_URL="http://${DOCKER_SUBNET}.100:7547"
+  if [ -n "$BASE_DOMAIN" ]; then
+    ACS_URL="http://cwmp-${INSTANCE_NAME}.${BASE_DOMAIN}"
+  fi
+
   if [ -d "$PARAM_DIR" ]; then
     echo ""
     read -p "$(echo -e "${Y}?${N} Restore parameter preset (virtual params, UI config)? (y/n): ")" DO_RESTORE
     if [[ "$DO_RESTORE" == "y" || "$DO_RESTORE" == "Y" ]]; then
       restore_parameters "$INSTANCE_NAME" "$VERSION"
-      # Auto-update ACS URL in provisions to match this instance
       update_provision_acs_url "$INSTANCE_NAME" "$ACS_URL"
     else
       info "Skipped parameter restore."
@@ -1374,7 +1038,6 @@ EOF
   echo -e "${G}  ✔ Instance '${W}$INSTANCE_NAME${G}' ready! (${VERSION})${N}"
   divider
 
-  load_config
   if [ -n "$BASE_DOMAIN" ]; then
     echo ""
     if [ "$SSL_ENABLED" == "true" ]; then
@@ -1390,36 +1053,19 @@ EOF
   echo -e "\n  ${D}Direct access:${N}"
   echo -e "  ${D}UI=:$PORT_UI | CWMP=:$PORT_CWMP | NBI=:$PORT_NBI | FS=:$PORT_FS${N}"
 
-  # --- L2TP Info ---
-  if [ -n "$L2TP_USER_PASS" ] && [ -n "$L2TP_USER_IP" ]; then
-    local PUBLIC_IP=$(get_public_ip)
-    echo ""
-    divider
-    echo -e "  ${C}L2TP VPN Connection:${N}"
-    echo -e "  ${D}Server${N}   : ${W}$PUBLIC_IP${N}"
-    echo -e "  ${D}Username${N} : ${W}$INSTANCE_NAME${N}"
-    echo -e "  ${D}Password${N} : ${W}$L2TP_USER_PASS${N}"
-    echo -e "  ${D}Client IP${N}: ${W}$L2TP_USER_IP${N}"
-    [ -n "$ONU_SUBNET" ] && echo -e "  ${D}ONU Subnet${N}: ${W}$ONU_SUBNET${N}"
-    echo ""
-    echo -e "  ${Y}ACS URL (set di ONU):${N}"
-    echo -e "  ${W}http://${L2TP_LOCAL_IP}:${PORT_CWMP}${N}"
-    echo ""
-    echo -e "  ${Y}Konfigurasi MikroTik:${N}"
-    echo -e "  ${D}1.${N} Buat L2TP Client (server: $PUBLIC_IP, user: $INSTANCE_NAME, pass: $L2TP_USER_PASS)"
-    echo -e "  ${D}2.${N} ${R}JANGAN${N} pakai masquerade di L2TP interface"
-    echo -e "  ${D}3.${N} Pastikan IP forwarding aktif di MikroTik"
-    echo ""
-    echo -e "  ${Y}Script MikroTik (copy-paste ke terminal MikroTik):${N}"
-    echo ""
-    echo -e "  ${D}# 1. Buat L2TP Client${N}"
-    echo -e "  ${W}/interface l2tp-client add name=Tunnel_GenieACS_Mostech connect-to=$PUBLIC_IP user=$INSTANCE_NAME password=$L2TP_USER_PASS disabled=no${N}"
-    echo ""
-    echo -e "  ${D}# 2. Firewall: Allow L2TP forward (POSISI PALING ATAS!)${N}"
-    echo -e "  ${W}/ip firewall filter add chain=forward in-interface=Tunnel_GenieACS_Mostech action=accept comment=\"Allow L2TP to LAN - By Mostech\" place-before=0${N}"
-    echo -e "  ${W}/ip firewall filter add chain=forward out-interface=Tunnel_GenieACS_Mostech action=accept comment=\"Allow LAN to L2TP - By Mostech\" place-before=1${N}"
-  fi
-
+  echo ""
+  divider
+  echo -e "  ${C}OpenVPN Connection (Isolasi Cluster):${N}"
+  echo -e "  ${D}Server IP${N} : ${W}$PUBLIC_IP${N}"
+  echo -e "  ${D}Port${N}      : ${W}$PORT_OPENVPN (UDP)${N}"
+  echo -e "  ${D}ONU Subnet${N}: ${W}$ONU_SUBNET${N}"
+  echo ""
+  echo -e "  ${Y}Download Profile VPN (.ovpn) untuk MikroTik:${N}"
+  echo -e "  ${W}$TARGET_DIR/ovpn-data/client.ovpn${N}"
+  echo -e "  ${D}(Copy file tersebut dan import ke router MikroTik/Client Anda)${N}"
+  echo ""
+  echo -e "  ${Y}ACS URL (Set di ONU):${N}"
+  echo -e "  ${W}$ACS_URL${N}"
   divider
 }
 
@@ -1505,6 +1151,92 @@ pause_instance() {
   fi
 }
 
+update_onu_subnet() {
+  header "UPDATE ONU SUBNET (ON-THE-FLY)"
+  if ! list_instances; then return; fi
+  if ! select_instance "Pilih nomor instance:"; then return; fi
+
+  local INSTANCE_NAME="$SELECTED_INSTANCE"
+  local TARGET_DIR="$INSTANCES_DIR/$INSTANCE_NAME"
+  local COMPOSE_FILE="$TARGET_DIR/docker-compose.yml"
+  local OVPN_CONTAINER="ovpn-${INSTANCE_NAME}"
+  local CWMP_CONTAINER="${INSTANCE_NAME}-genieacs-cwmp-1"
+
+  if [ ! -f "$COMPOSE_FILE" ]; then
+    err "File compose tidak ditemukan: $COMPOSE_FILE"; return
+  fi
+
+  local DOCKER_SUBNET_CIDR DOCKER_BASE DOCKER_GATEWAY
+  DOCKER_SUBNET_CIDR=$(grep -oP '(?<=subnet:\s)[0-9]+\.[0-9]+\.[0-9]+\.0/24' "$COMPOSE_FILE" | head -1)
+  if [ -z "$DOCKER_SUBNET_CIDR" ]; then
+    err "Tidak bisa membaca subnet Docker instance."; return
+  fi
+  DOCKER_BASE=$(echo "$DOCKER_SUBNET_CIDR" | cut -d'.' -f1-3)
+  DOCKER_GATEWAY="${DOCKER_BASE}.254"
+
+  local CURRENT_SUBNET=""
+  if [ -f "$TARGET_DIR/.onu_subnet" ]; then
+    CURRENT_SUBNET=$(cat "$TARGET_DIR/.onu_subnet")
+  else
+    CURRENT_SUBNET=$(grep -oP 'ip route add \K[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+' "$COMPOSE_FILE" | head -1)
+  fi
+
+  [ -n "$CURRENT_SUBNET" ] && info "Subnet saat ini: ${W}$CURRENT_SUBNET${N}"
+  read -p "$(echo -e "${B}►${N} Subnet ONU baru (contoh: 192.168.20.0/24): ")" NEW_ONU_SUBNET
+  if [[ ! "$NEW_ONU_SUBNET" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]]; then
+    err "Format subnet tidak valid!"; return
+  fi
+  if [ "$NEW_ONU_SUBNET" == "$CURRENT_SUBNET" ]; then
+    warn "Subnet baru sama dengan subnet saat ini."; return
+  fi
+
+  local CIDR SUBNET_IP NETMASK
+  CIDR=$(echo "$NEW_ONU_SUBNET" | cut -d/ -f2)
+  SUBNET_IP=$(echo "$NEW_ONU_SUBNET" | cut -d/ -f1)
+
+  local full_octets partial_octet i
+  full_octets=$((CIDR / 8))
+  partial_octet=$((CIDR % 8))
+  NETMASK=""
+  for ((i=0; i<4; i+=1)); do
+    if [ "$i" -lt "$full_octets" ]; then
+      NETMASK+="255"
+    elif [ "$i" -eq "$full_octets" ] && [ "$partial_octet" -ne 0 ]; then
+      NETMASK+=$((256 - 2**(8-partial_octet)))
+    else
+      NETMASK+="0"
+    fi
+    [ "$i" -lt 3 ] && NETMASK+="."
+  done
+
+  step "Updating OpenVPN route..."
+  if ! docker ps --format '{{.Names}}' | grep -q "^${OVPN_CONTAINER}$"; then
+    err "Container OpenVPN tidak berjalan: $OVPN_CONTAINER"; return
+  fi
+  docker exec "$OVPN_CONTAINER" sh -c "mkdir -p /etc/openvpn/ccd" 2>/dev/null
+  docker exec "$OVPN_CONTAINER" sh -c "echo 'iroute $SUBNET_IP $NETMASK' > /etc/openvpn/ccd/client" 2>/dev/null
+  docker exec "$OVPN_CONTAINER" sed -i '/^route [0-9]/d' /etc/openvpn/server/server.conf 2>/dev/null
+  docker exec "$OVPN_CONTAINER" sh -c "echo 'route $SUBNET_IP $NETMASK' >> /etc/openvpn/server/server.conf" 2>/dev/null
+  docker restart "$OVPN_CONTAINER" >/dev/null 2>&1
+  ok "OpenVPN route updated (${NEW_ONU_SUBNET})."
+
+  step "Updating CWMP startup route..."
+  sed -i -E "s|ip route add [0-9.]+/[0-9]+ via ${DOCKER_GATEWAY} && \./dist/bin/genieacs-cwmp|ip route add ${NEW_ONU_SUBNET} via ${DOCKER_GATEWAY} \&\& ./dist/bin/genieacs-cwmp|g" "$COMPOSE_FILE"
+
+  # Apply immediately in running container (best effort) before recreate.
+  if docker ps --format '{{.Names}}' | grep -q "^${CWMP_CONTAINER}$"; then
+    [ -n "$CURRENT_SUBNET" ] && docker exec "$CWMP_CONTAINER" ip route del "$CURRENT_SUBNET" 2>/dev/null || true
+    docker exec "$CWMP_CONTAINER" ip route replace "$NEW_ONU_SUBNET" via "$DOCKER_GATEWAY" 2>/dev/null || true
+  fi
+
+  (cd "$TARGET_DIR" && $DOCKER_COMPOSE up -d --no-deps genieacs-cwmp >/dev/null 2>&1)
+  echo "$NEW_ONU_SUBNET" > "$TARGET_DIR/.onu_subnet"
+  log_action "ROUTE" "Updated ONU subnet for '$INSTANCE_NAME': ${CURRENT_SUBNET:-unknown} -> $NEW_ONU_SUBNET"
+
+  ok "ONU subnet instance '${INSTANCE_NAME}' berhasil diupdate."
+  info "OpenVPN dan CWMP telah disinkronkan ke subnet baru."
+}
+
 # ╔══════════════════════════════════════╗
 # ║            UNINSTALL                 ║
 # ╚══════════════════════════════════════╝
@@ -1522,19 +1254,6 @@ uninstall_instance() {
   read -p "$(echo -e "${R}✘${N} Ketik ${W}$INSTANCE_NAME${N} untuk konfirmasi: ")" CONFIRM
 
   if [ "$CONFIRM" == "$INSTANCE_NAME" ]; then
-    # Delete ONU route if exists
-    if [ -f "$TARGET_DIR/.onu_subnet" ]; then
-      step "Removing ONU route..."
-      remove_onu_route "$INSTANCE_NAME"
-    fi
-
-    # Delete L2TP user if exists
-    if check_l2tp_installed && l2tp_user_exists "$INSTANCE_NAME"; then
-      step "Removing L2TP user '$INSTANCE_NAME'..."
-      delete_l2tp_user "$INSTANCE_NAME"
-      ok "L2TP user removed."
-    fi
-
     step "Removing containers, images, volumes..."
     cd "$TARGET_DIR" || return
     $DOCKER_COMPOSE down -v --rmi all
@@ -1599,6 +1318,7 @@ manage_instance_menu() {
     echo -e "  ${C}▸${N} ${W}2${N}  📊  Monitor Resources"
     echo -e "  ${C}▸${N} ${W}3${N}  ⏸️   Pause / Unpause"
     echo -e "  ${C}▸${N} ${W}4${N}  🗑️   Uninstall Instance"
+    echo -e "  ${C}▸${N} ${W}5${N}  🔁  Update ONU Subnet"
     echo -e "  ${C}▸${N} ${W}0${N}  ↩️   Back"
     divider
     read -p "$(echo -e "${B}►${N} Pilihan: ")" INST_MENU
@@ -1608,6 +1328,7 @@ manage_instance_menu() {
       2) monitor_instance ;;
       3) pause_instance ;;
       4) uninstall_instance ;;
+      5) update_onu_subnet ;;
       0) return ;;
       *) err "Invalid option." ;;
     esac
@@ -1670,8 +1391,7 @@ services_menu() {
     clear
     header "SERVICES & SETTINGS"
 
-    local l2tp_status nginx_status certbot_status
-    check_l2tp_installed && l2tp_status="${G}Active${N}" || l2tp_status="${D}Off${N}"
+    local nginx_status certbot_status
     [ -n "$(docker ps -q -f name=mostech-nginx-proxy 2>/dev/null)" ] && \
       nginx_status="${G}Active${N}" || nginx_status="${D}Off${N}"
     docker image inspect certbot/dns-cloudflare >/dev/null 2>&1 && \
@@ -1683,7 +1403,7 @@ services_menu() {
 
     load_config
     echo ""
-    echo -e "  ${D}L2TP:${N} $l2tp_status  │  ${D}Nginx:${N} $nginx_status  │  ${D}Certbot:${N} $certbot_status"
+    echo -e "  ${D}Nginx:${N} $nginx_status  │  ${D}Certbot:${N} $certbot_status"
     echo -e "  ${D}Domain:${N} ${W}${BASE_DOMAIN:-none}${N}  │  ${D}SSL:${N} $([ "$SSL_ENABLED" == "true" ] && echo -e "${G}Active${N}" || echo -e "${D}Off${N}")"
     echo -e "  ${D}Source Stable:${N} $stable_label  │  ${D}Source Latest:${N} $latest_label"
     divider
@@ -1720,8 +1440,7 @@ show_menu() {
   local instance_count
   instance_count=$(count_instances)
 
-  local l2tp_label docker_label ssl_label
-  check_l2tp_installed && l2tp_label="${G}● Active${N}" || l2tp_label="${R}○ Off${N}"
+  local docker_label ssl_label
   command -v docker &>/dev/null && docker info &>/dev/null 2>&1 && docker_label="${G}● Active${N}" || docker_label="${R}○ Off${N}"
   [ "$SSL_ENABLED" == "true" ] && ssl_label="${G}● Active${N}" || ssl_label="${D}○ Off${N}"
 
@@ -1738,7 +1457,6 @@ show_menu() {
   echo -e "${C}  ┌──────────────────────────────────┐${N}"
   echo -e "${C}  │${N}  ${D}Domain${N}     ${W}${BASE_DOMAIN:-none}${N}"
   echo -e "${C}  │${N}  ${D}SSL${N}        $ssl_label"
-  echo -e "${C}  │${N}  ${D}L2TP${N}       $l2tp_label"
   echo -e "${C}  │${N}  ${D}Docker${N}     $docker_label"
   echo -e "${C}  │${N}  ${D}Instances${N}  ${W}$instance_count${N}"
   echo -e "${C}  └──────────────────────────────────┘${N}"
@@ -1750,9 +1468,6 @@ show_menu() {
   echo ""
   divider
 }
-
-# Restore ONU routes on start
-restore_onu_routes
 
 log_action "SYSTEM" "Manager started"
 while true; do
