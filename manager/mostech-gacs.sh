@@ -234,11 +234,70 @@ uninstall_nginx_service() {
   log_action "SERVICE" "Nginx proxy uninstalled"
   ok "Nginx proxy removed."
 }
+install_radius_service() {
+  header "INSTALL CENTRAL RADIUS (daloRADIUS Official)"
+  local RADIUS_DIR="/home/well/GACS-Farm/radius"
+  
+  if [ ! -d "$RADIUS_DIR" ]; then
+    step "Cloning official daloRADIUS repository..."
+    git clone https://github.com/lirantal/daloradius.git "$RADIUS_DIR" >/dev/null 2>&1
+  fi
+  
+  if ! docker network ls | grep -qw 'gacs-radius-net'; then
+    docker network create gacs-radius-net >/dev/null 2>&1
+    info "Created global network 'gacs-radius-net'."
+  fi
 
+  # Mencegah bentrok port 80 dengan Nginx Proxy Host
+  sed -i "s/- '80:80'/- '8080:80'/g" "$RADIUS_DIR/docker-compose.yml"
+
+  cat > "$RADIUS_DIR/docker-compose.override.yml" <<EOF
+services:
+  radius-mysql:
+    networks:
+      - default
+      - gacs-radius-net
+  radius:
+    networks:
+      - default
+      - gacs-radius-net
+  radius-web:
+    networks:
+      - default
+      - gacs-radius-net
+
+networks:
+  gacs-radius-net:
+    external: true
+EOF
+
+  step "Building and starting daloRADIUS containers..."
+  (cd "$RADIUS_DIR" && $DOCKER_COMPOSE up -d --build) || { err "Failed to start RADIUS."; return; }
+  
+  echo ""
+  ok "Central RADIUS (Official daloRADIUS) is now running!"
+  echo -e "  ${D}RADIUS Auth:${N} ${W}Port 1812 UDP${N}"
+  echo -e "  ${D}RADIUS Acct:${N} ${W}Port 1813 UDP${N}"
+  echo -e "  ${D}Web UI (daloRADIUS):${N} ${W}http://<IP_SERVER>:8080${N}"
+  echo -e "  ${D}Login UI:${N} ${W}administrator${N} / ${W}radius${N}"
+  echo ""
+}
+
+uninstall_radius_service() {
+  header "UNINSTALL CENTRAL RADIUS"
+  local RADIUS_DIR="/home/well/GACS-Farm/radius"
+  if [ -d "$RADIUS_DIR" ]; then
+    (cd "$RADIUS_DIR" && $DOCKER_COMPOSE down -v)
+    rm -rf "$RADIUS_DIR"
+    ok "Central RADIUS uninstalled."
+  else
+    warn "Central RADIUS is not installed."
+  fi
+}
 services_install_menu() {
   header "INSTALL SERVICES"
 
-  local nginx_status certbot_status
+  local nginx_status certbot_status radius_status
 
   docker ps -q -f name=mostech-nginx-proxy >/dev/null 2>&1 && \
     [ -n "$(docker ps -q -f name=mostech-nginx-proxy)" ] && \
@@ -247,10 +306,15 @@ services_install_menu() {
   docker image inspect certbot/dns-cloudflare >/dev/null 2>&1 && \
     certbot_status="${G}Ready${N}" || certbot_status="${D}Not installed${N}"
 
+  docker ps -q -f name=gacs-central-radius >/dev/null 2>&1 && \
+    [ -n "$(docker ps -q -f name=gacs-central-radius)" ] && \
+    radius_status="${G}Running${N}" || radius_status="${D}Not running${N}"
+
   echo ""
   echo -e "  ${W}1.${N} Nginx Proxy      [$nginx_status]"
   echo -e "  ${W}2.${N} Certbot (SSL)    [$certbot_status]"
-  echo -e "  ${W}3.${N} Install All"
+  echo -e "  ${W}3.${N} Central RADIUS   [$radius_status]"
+  echo -e "  ${W}4.${N} Install All"
   echo -e "  ${W}0.${N} Back"
   divider
   read -p "$(echo -e "${B}►${N} Pilihan: ")" SVC_CHOICE
@@ -258,9 +322,11 @@ services_install_menu() {
   case $SVC_CHOICE in
     1) install_nginx_service ;;
     2) install_certbot ;;
-    3)
+    3) install_radius_service ;;
+    4)
       install_nginx_service
       install_certbot
+      install_radius_service
       echo ""
       ok "All services installed."
       ;;
@@ -272,7 +338,7 @@ services_install_menu() {
 services_uninstall_menu() {
   header "UNINSTALL SERVICES"
 
-  local nginx_status certbot_status
+  local nginx_status certbot_status radius_status
 
   [ -n "$(docker ps -q -f name=mostech-nginx-proxy 2>/dev/null)" ] && \
     nginx_status="${G}Running${N}" || nginx_status="${D}Not running${N}"
@@ -280,10 +346,14 @@ services_uninstall_menu() {
   docker image inspect certbot/dns-cloudflare >/dev/null 2>&1 && \
     certbot_status="${G}Installed${N}" || certbot_status="${D}Not installed${N}"
 
+  [ -n "$(docker ps -q -f name=gacs-central-radius 2>/dev/null)" ] && \
+    radius_status="${G}Installed${N}" || radius_status="${D}Not installed${N}"
+
   echo ""
   echo -e "  ${W}1.${N} Nginx Proxy      [$nginx_status]"
   echo -e "  ${W}2.${N} Certbot (SSL)    [$certbot_status]"
-  echo -e "  ${W}3.${N} Uninstall All"
+  echo -e "  ${W}3.${N} Central RADIUS   [$radius_status]"
+  echo -e "  ${W}4.${N} Uninstall All"
   echo -e "  ${W}0.${N} Back"
   divider
   read -p "$(echo -e "${B}►${N} Pilihan: ")" SVC_CHOICE
@@ -291,9 +361,11 @@ services_uninstall_menu() {
   case $SVC_CHOICE in
     1) uninstall_nginx_service ;;
     2) uninstall_certbot ;;
-    3)
+    3) uninstall_radius_service ;;
+    4)
       uninstall_nginx_service
       uninstall_certbot
+      uninstall_radius_service
       echo ""
       ok "All services removed."
       ;;
@@ -329,60 +401,74 @@ setup_domain() {
     warn "Pastikan wildcard DNS aktif: ${W}*.${BASE_DOMAIN} → A → <IP SERVER>${N}"
   fi
 
-  echo -e "\n${W}[ 2/3 ] Cloudflare API Token${N}"
-  if [ -n "$CF_API_TOKEN" ]; then
-    local masked="${CF_API_TOKEN:0:6}...${CF_API_TOKEN: -4}"
-    info "Token: ${D}$masked${N}"
-    read -p "$(echo -e "${Y}?${N} Ganti token? (y/n): ")" CHANGE_TOKEN
-  else
-    CHANGE_TOKEN="y"
-  fi
+  echo -e "\n${W}[ 2/3 ] Setup SSL Wildcard Otomatis${N}"
+  info "GACS-Farm mendukung auto-SSL (HTTPS) menggunakan Let's Encrypt Wildcard dengan verifikasi Cloudflare DNS."
+  read -p "$(echo -e "${Y}?${N} Gunakan Cloudflare SSL otomatis? (y/n - ketik 'n' jika ingin HTTP / proxy manual): ")" USE_CF_SSL
 
-  if [[ "$CHANGE_TOKEN" == "y" || "$CHANGE_TOKEN" == "Y" ]]; then
-    read -p "$(echo -e "${B}►${N} Cloudflare API Token: ")" NEW_TOKEN
-    [ -z "$NEW_TOKEN" ] && { err "Token kosong!"; return; }
-
-    step "Validating token..."
-    local verify_result
-    verify_result=$(curl -s -X GET "https://api.cloudflare.com/client/v4/user/tokens/verify" \
-      -H "Authorization: Bearer $NEW_TOKEN" -H "Content-Type: application/json")
-    local token_status
-    token_status=$(echo "$verify_result" | grep -o '"status":"[^"]*"' | head -1 | cut -d'"' -f4)
-    if [ "$token_status" != "active" ]; then
-      err "Token tidak valid!"; return
+  if [[ "$USE_CF_SSL" == "y" || "$USE_CF_SSL" == "Y" ]]; then
+    if [ -n "$CF_API_TOKEN" ]; then
+      local masked="${CF_API_TOKEN:0:6}...${CF_API_TOKEN: -4}"
+      info "Token: ${D}$masked${N}"
+      read -p "$(echo -e "${Y}?${N} Ganti token? (y/n): ")" CHANGE_TOKEN
+    else
+      CHANGE_TOKEN="y"
     fi
-    ok "Token valid."
 
-    step "Checking zone access for '$BASE_DOMAIN'..."
-    local zone_result
-    zone_result=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=$BASE_DOMAIN" \
-      -H "Authorization: Bearer $NEW_TOKEN" -H "Content-Type: application/json")
-    local zone_count
-    zone_count=$(echo "$zone_result" | grep -o '"count":[0-9]*' | head -1 | cut -d':' -f2)
-    if [ "$zone_count" == "0" ] || [ -z "$zone_count" ]; then
-      err "Token tidak punya akses ke zone '$BASE_DOMAIN'!"; return
+    if [[ "$CHANGE_TOKEN" == "y" || "$CHANGE_TOKEN" == "Y" ]]; then
+      read -p "$(echo -e "${B}►${N} Cloudflare API Token: ")" NEW_TOKEN
+      [ -z "$NEW_TOKEN" ] && { err "Token kosong!"; return; }
+
+      step "Validating token..."
+      local verify_result
+      verify_result=$(curl -s -X GET "https://api.cloudflare.com/client/v4/user/tokens/verify" \
+        -H "Authorization: Bearer $NEW_TOKEN" -H "Content-Type: application/json")
+      local token_status
+      token_status=$(echo "$verify_result" | grep -o '"status":"[^"]*"' | head -1 | cut -d'"' -f4)
+      if [ "$token_status" != "active" ]; then
+        err "Token tidak valid!"; return
+      fi
+      ok "Token valid."
+
+      step "Checking zone access for '$BASE_DOMAIN'..."
+      local zone_result
+      zone_result=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=$BASE_DOMAIN" \
+        -H "Authorization: Bearer $NEW_TOKEN" -H "Content-Type: application/json")
+      local zone_count
+      zone_count=$(echo "$zone_result" | grep -o '"count":[0-9]*' | head -1 | cut -d':' -f2)
+      if [ "$zone_count" == "0" ] || [ -z "$zone_count" ]; then
+        err "Token tidak punya akses ke zone '$BASE_DOMAIN'!"; return
+      fi
+      ok "Zone access confirmed."
+      CF_API_TOKEN="$NEW_TOKEN"
     fi
-    ok "Zone access confirmed."
-    CF_API_TOKEN="$NEW_TOKEN"
-  fi
 
-  echo -e "\n${W}[ 3/3 ] SSL Certificate${N}"
-  if [ -z "$CF_EMAIL" ]; then
-    read -p "$(echo -e "${B}►${N} Email untuk Let's Encrypt: ")" CF_EMAIL
+    echo -e "\n${W}[ 3/3 ] SSL Certificate${N}"
+    if [ -z "$CF_EMAIL" ]; then
+      read -p "$(echo -e "${B}►${N} Email untuk Let's Encrypt: ")" CF_EMAIL
+    else
+      info "Email: $CF_EMAIL"
+      read -p "$(echo -e "${Y}?${N} Ganti email? (y/n): ")" CHANGE_EMAIL
+      [[ "$CHANGE_EMAIL" == "y" || "$CHANGE_EMAIL" == "Y" ]] && \
+        read -p "$(echo -e "${B}►${N} Email baru: ")" CF_EMAIL
+    fi
+
+    save_config
+    log_action "SETUP" "Domain=$BASE_DOMAIN | CF Token configured | Email=$CF_EMAIL"
+    setup_nginx
+
+    echo ""
+    read -p "$(echo -e "${Y}?${N} Issue Wildcard SSL Certificate sekarang? (y/n): ")" DO_SSL
+    [[ "$DO_SSL" == "y" || "$DO_SSL" == "Y" ]] && issue_ssl_cert
   else
-    info "Email: $CF_EMAIL"
-    read -p "$(echo -e "${Y}?${N} Ganti email? (y/n): ")" CHANGE_EMAIL
-    [[ "$CHANGE_EMAIL" == "y" || "$CHANGE_EMAIL" == "Y" ]] && \
-      read -p "$(echo -e "${B}►${N} Email baru: ")" CF_EMAIL
+    info "Cloudflare SSL dilewati. GACS-Farm akan menggunakan HTTP polos (atau Anda bisa setup reverse proxy di sisi lain)."
+    CF_API_TOKEN=""
+    CF_EMAIL=""
+    SSL_ENABLED=""
+    save_config
+    log_action "SETUP" "Domain=$BASE_DOMAIN | No SSL Configured"
+    setup_nginx
+    ok "Setup domain (HTTP) selesai."
   fi
-
-  save_config
-  log_action "SETUP" "Domain=$BASE_DOMAIN | CF Token configured | Email=$CF_EMAIL"
-  setup_nginx
-
-  echo ""
-  read -p "$(echo -e "${Y}?${N} Issue Wildcard SSL Certificate sekarang? (y/n): ")" DO_SSL
-  [[ "$DO_SSL" == "y" || "$DO_SSL" == "Y" ]] && issue_ssl_cert
 }
 
 issue_ssl_cert() {
@@ -847,17 +933,38 @@ install_instance() {
     return
   fi
 
+  echo -e "\n${W}Pilih tipe VPN untuk Site-to-ACS:${N}"
+  echo "  1. OpenVPN (Default, port tunggal)"
+  echo "  2. L2TP/IPsec (hwdsl2/docker-ipsec-vpn-server)"
+  read -p "$(echo -e "${B}►${N} Pilihan (1/2): ")" VPN_CHOICE
+  [[ "$VPN_CHOICE" != "2" ]] && VPN_CHOICE=1
+
   step "Allocating ports..."
   PORT_CWMP=$(get_random_free_port)
   PORT_NBI=$(get_random_free_port)
   PORT_FS=$(get_random_free_port)
   PORT_UI=$(get_random_free_port)
-  PORT_OPENVPN=$(get_random_free_port)
   DOCKER_SUBNET="10.$((RANDOM % 200 + 10)).$((RANDOM % 250))"
-  ok "Ports: CWMP=${W}$PORT_CWMP${N} | NBI=${W}$PORT_NBI${N} | FS=${W}$PORT_FS${N} | UI=${W}$PORT_UI${N} | VPN=${W}$PORT_OPENVPN${N}"
+
+  if [ "$VPN_CHOICE" == "2" ]; then
+    PORT_IPSEC_500=$(get_random_free_port)
+    PORT_IPSEC_4500=$(get_random_free_port)
+    VPN_IPSEC_PSK=$(generate_random_password 16)
+    VPN_USER="gacs-${INSTANCE_NAME}"
+    VPN_PASSWORD=$(generate_random_password 12)
+    ok "Ports: CWMP=${W}$PORT_CWMP${N} | NBI=${W}$PORT_NBI${N} | FS=${W}$PORT_FS${N} | UI=${W}$PORT_UI${N} | IPsec=500:${W}$PORT_IPSEC_500${N}, 4500:${W}$PORT_IPSEC_4500${N}"
+  else
+    PORT_OPENVPN=$(get_random_free_port)
+    ok "Ports: CWMP=${W}$PORT_CWMP${N} | NBI=${W}$PORT_NBI${N} | FS=${W}$PORT_FS${N} | UI=${W}$PORT_UI${N} | VPN=${W}$PORT_OPENVPN${N}"
+  fi
 
   TARGET_DIR="$INSTANCES_DIR/$INSTANCE_NAME"
   mkdir -p "$TARGET_DIR"
+
+  if ! docker network ls | grep -qw 'gacs-radius-net'; then
+    docker network create gacs-radius-net >/dev/null 2>&1
+    info "Created global network 'gacs-radius-net' untuk integrasi RADIUS."
+  fi
 
   # --- ONU Subnet Route ---
   echo ""
@@ -876,21 +983,58 @@ install_instance() {
 
   PUBLIC_IP=$(get_public_ip)
   load_config
-  if [ -n "$BASE_DOMAIN" ]; then
+  if [ "$VPN_CHOICE" == "2" ]; then
     cat > "$TARGET_DIR/vpn.env" <<EOF
+VPN_IPSEC_PSK=${VPN_IPSEC_PSK}
+VPN_USER=${VPN_USER}
+VPN_PASSWORD=${VPN_PASSWORD}
+VPN_L2TP_NET=${VPN_POOL_BASE}.0/24
+VPN_L2TP_LOCAL=${VPN_POOL_BASE}.1
+VPN_L2TP_POOL=${VPN_POOL_BASE}.10-${VPN_POOL_BASE}.250
+EOF
+  else
+    if [ -n "$BASE_DOMAIN" ]; then
+      cat > "$TARGET_DIR/vpn.env" <<EOF
 VPN_DNS_NAME=acs-${INSTANCE_NAME}.${BASE_DOMAIN}
 VPN_PORT=${PORT_OPENVPN}
 VPN_PROTO=udp
 EOF
-  else
-    cat > "$TARGET_DIR/vpn.env" <<EOF
+    else
+      cat > "$TARGET_DIR/vpn.env" <<EOF
 VPN_PORT=${PORT_OPENVPN}
 VPN_PROTO=udp
 EOF
+    fi
   fi
 
   cat > "$TARGET_DIR/docker-compose.yml" <<EOF
 services:
+EOF
+
+  if [ "$VPN_CHOICE" == "2" ]; then
+    cat >> "$TARGET_DIR/docker-compose.yml" <<EOF
+  ipsec-vpn:
+    image: hwdsl2/ipsec-vpn-server
+    container_name: ipsec-${INSTANCE_NAME}
+    restart: always
+    env_file:
+      - ./vpn.env
+    ports:
+      - "${PORT_IPSEC_500}:500/udp"
+      - "${PORT_IPSEC_4500}:4500/udp"
+    cap_add:
+      - NET_ADMIN
+    privileged: true
+    sysctls:
+      - net.ipv4.ip_forward=1
+      - net.ipv6.conf.all.forwarding=1
+    networks:
+      genieacs-net:
+        ipv4_address: ${DOCKER_SUBNET}.254
+      gacs-radius-net:
+EOF
+  else
+    cat >> "$TARGET_DIR/docker-compose.yml" <<EOF
   openvpn:
     image: hwdsl2/openvpn-server
     container_name: ovpn-${INSTANCE_NAME}
@@ -910,6 +1054,11 @@ services:
     networks:
       genieacs-net:
         ipv4_address: ${DOCKER_SUBNET}.254
+      gacs-radius-net:
+EOF
+  fi
+
+  cat >> "$TARGET_DIR/docker-compose.yml" <<EOF
 
   mongodb:
     image: mongo:4.4
@@ -991,62 +1140,74 @@ networks:
     ipam:
       config:
         - subnet: ${DOCKER_SUBNET}.0/24
+  gacs-radius-net:
+    external: true
 EOF
 
   step "Building & starting containers..."
-  log_action "INSTALL" "START - '$INSTANCE_NAME' ver=$VERSION | CWMP=$PORT_CWMP NBI=$PORT_NBI FS=$PORT_FS UI=$PORT_UI OVPN=$PORT_OPENVPN"
+  if [ "$VPN_CHOICE" == "2" ]; then
+    log_action "INSTALL" "START - '$INSTANCE_NAME' ver=$VERSION | CWMP=$PORT_CWMP NBI=$PORT_NBI FS=$PORT_FS UI=$PORT_UI IPsec=$PORT_IPSEC_500,$PORT_IPSEC_4500"
+  else
+    log_action "INSTALL" "START - '$INSTANCE_NAME' ver=$VERSION | CWMP=$PORT_CWMP NBI=$PORT_NBI FS=$PORT_FS UI=$PORT_UI OVPN=$PORT_OPENVPN"
+  fi
   (cd "$TARGET_DIR" && $DOCKER_COMPOSE up -d --build)
+  
+  step "Menunggu layanan siap (sleep 15s)..."
+  sleep 15
 
   generate_nginx_conf "$INSTANCE_NAME" "$PORT_UI" "$PORT_CWMP" "$PORT_NBI" "$PORT_FS"
 
-  step "Configuring OpenVPN Client routing (iroute)..."
-  sleep 5
-  local CIDR=$(echo "$ONU_SUBNET" | cut -d/ -f2)
-  local SUBNET_IP=$(echo "$ONU_SUBNET" | cut -d/ -f1)
-  
-  local full_octets=$((CIDR/8))
-  local partial_octet=$((CIDR%8))
-  local NETMASK=""
-  for ((i=0;i<4;i+=1)); do
-    if [ $i -lt $full_octets ]; then
-      NETMASK+="255"
-    elif [ $i -eq $full_octets ]; then
-      NETMASK+=$((256 - 2**(8-partial_octet)))
-    else
-      NETMASK+="0"
-    fi
-    test $i -lt 3 && NETMASK+="."
-  done
+  if [ "$VPN_CHOICE" == "1" ]; then
+    step "Configuring OpenVPN Client routing (iroute)..."
+    local CIDR=$(echo "$ONU_SUBNET" | cut -d/ -f2)
+    local SUBNET_IP=$(echo "$ONU_SUBNET" | cut -d/ -f1)
+    
+    local full_octets=$((CIDR/8))
+    local partial_octet=$((CIDR%8))
+    local NETMASK=""
+    for ((i=0;i<4;i+=1)); do
+      if [ $i -lt $full_octets ]; then
+        NETMASK+="255"
+      elif [ $i -eq $full_octets ]; then
+        NETMASK+=$((256 - 2**(8-partial_octet)))
+      else
+        NETMASK+="0"
+      fi
+      test $i -lt 3 && NETMASK+="."
+    done
 
-  docker exec ovpn-${INSTANCE_NAME} sh -c "mkdir -p /etc/openvpn/ccd" 2>/dev/null
-  docker exec ovpn-${INSTANCE_NAME} sh -c "echo 'iroute $SUBNET_IP $NETMASK' > /etc/openvpn/ccd/client" 2>/dev/null
-  docker exec ovpn-${INSTANCE_NAME} sh -c "grep -q 'client-config-dir' /etc/openvpn/server/server.conf || echo 'client-config-dir /etc/openvpn/ccd' >> /etc/openvpn/server/server.conf" 2>/dev/null
-  docker exec ovpn-${INSTANCE_NAME} sh -c "grep -q 'route $SUBNET_IP' /etc/openvpn/server/server.conf || echo 'route $SUBNET_IP $NETMASK' >> /etc/openvpn/server/server.conf" 2>/dev/null
-  
-  # Fix MikroTik compatibility: disable tls-crypt entirely to prevent auth digest errors
-  docker exec ovpn-${INSTANCE_NAME} sed -i '/tls-crypt tc.key/d' /etc/openvpn/server/server.conf 2>/dev/null
-  docker exec ovpn-${INSTANCE_NAME} sed -i -e '/<tls-crypt>/,/<\/tls-crypt>/d' /etc/openvpn/clients/client.ovpn 2>/dev/null
-  docker exec ovpn-${INSTANCE_NAME} sed -i '/ignore-unknown-option/d' /etc/openvpn/clients/client.ovpn 2>/dev/null
-  
-  # Fix MikroTik null-digest error by switching AEAD cipher (GCM) to CBC
-  docker exec ovpn-${INSTANCE_NAME} sed -i 's/cipher AES-128-GCM/cipher AES-256-CBC\ndata-ciphers AES-256-CBC/g' /etc/openvpn/server/server.conf 2>/dev/null
-  docker exec ovpn-${INSTANCE_NAME} sed -i 's/cipher AES-128-GCM/cipher AES-256-CBC/g' /etc/openvpn/clients/client.ovpn 2>/dev/null
-  
-  # Remove unsupported push options that cause MikroTik to fail getting IP
-  docker exec ovpn-${INSTANCE_NAME} sed -i '/push "redirect-gateway/d' /etc/openvpn/server/server.conf 2>/dev/null
-  docker exec ovpn-${INSTANCE_NAME} sed -i '/push "block-ipv6/d' /etc/openvpn/server/server.conf 2>/dev/null
-  docker exec ovpn-${INSTANCE_NAME} sed -i '/push "ifconfig-ipv6/d' /etc/openvpn/server/server.conf 2>/dev/null
-  docker exec ovpn-${INSTANCE_NAME} sed -i '/push "dhcp-option/d' /etc/openvpn/server/server.conf 2>/dev/null
-  docker exec ovpn-${INSTANCE_NAME} sed -i '/push "block-outside-dns/d' /etc/openvpn/server/server.conf 2>/dev/null
-  
-  # Unique tun /24 per instance (default image uses 10.8.0.0 — replace for RADIUS per-customer allow)
-  docker exec ovpn-${INSTANCE_NAME} sed -i "s|^server[[:space:]].*|server ${VPN_POOL_BASE} 255.255.255.0|" /etc/openvpn/server/server.conf 2>/dev/null
-  docker exec ovpn-${INSTANCE_NAME} sh -c ': > /etc/openvpn/server/ipp.txt' 2>/dev/null
+    docker exec ovpn-${INSTANCE_NAME} sh -c "mkdir -p /etc/openvpn/ccd" 2>/dev/null
+    docker exec ovpn-${INSTANCE_NAME} sh -c "echo 'iroute $SUBNET_IP $NETMASK' > /etc/openvpn/ccd/client" 2>/dev/null
+    docker exec ovpn-${INSTANCE_NAME} sh -c "grep -q 'client-config-dir' /etc/openvpn/server/server.conf || echo 'client-config-dir /etc/openvpn/ccd' >> /etc/openvpn/server/server.conf" 2>/dev/null
+    docker exec ovpn-${INSTANCE_NAME} sh -c "grep -q 'route $SUBNET_IP' /etc/openvpn/server/server.conf || echo 'route $SUBNET_IP $NETMASK' >> /etc/openvpn/server/server.conf" 2>/dev/null
+    
+    # Fix MikroTik compatibility: disable tls-crypt entirely to prevent auth digest errors
+    docker exec ovpn-${INSTANCE_NAME} sed -i '/tls-crypt tc.key/d' /etc/openvpn/server/server.conf 2>/dev/null
+    docker exec ovpn-${INSTANCE_NAME} sed -i -e '/<tls-crypt>/,/<\/tls-crypt>/d' /etc/openvpn/clients/client.ovpn 2>/dev/null
+    docker exec ovpn-${INSTANCE_NAME} sed -i '/ignore-unknown-option/d' /etc/openvpn/clients/client.ovpn 2>/dev/null
+    
+    # Fix MikroTik null-digest error by switching AEAD cipher (GCM) to CBC
+    docker exec ovpn-${INSTANCE_NAME} sed -i 's/cipher AES-128-GCM/cipher AES-256-CBC\ndata-ciphers AES-256-CBC/g' /etc/openvpn/server/server.conf 2>/dev/null
+    docker exec ovpn-${INSTANCE_NAME} sed -i 's/cipher AES-128-GCM/cipher AES-256-CBC/g' /etc/openvpn/clients/client.ovpn 2>/dev/null
+    
+    # Remove unsupported push options that cause MikroTik to fail getting IP
+    docker exec ovpn-${INSTANCE_NAME} sed -i '/push "redirect-gateway/d' /etc/openvpn/server/server.conf 2>/dev/null
+    docker exec ovpn-${INSTANCE_NAME} sed -i '/push "block-ipv6/d' /etc/openvpn/server/server.conf 2>/dev/null
+    docker exec ovpn-${INSTANCE_NAME} sed -i '/push "ifconfig-ipv6/d' /etc/openvpn/server/server.conf 2>/dev/null
+    docker exec ovpn-${INSTANCE_NAME} sed -i '/push "dhcp-option/d' /etc/openvpn/server/server.conf 2>/dev/null
+    docker exec ovpn-${INSTANCE_NAME} sed -i '/push "block-outside-dns/d' /etc/openvpn/server/server.conf 2>/dev/null
+    
+    # Unique tun /24 per instance (default image uses 10.8.0.0 — replace for RADIUS per-customer allow)
+    docker exec ovpn-${INSTANCE_NAME} sed -i "s|^server[[:space:]].*|server ${VPN_POOL_BASE} 255.255.255.0|" /etc/openvpn/server/server.conf 2>/dev/null
+    docker exec ovpn-${INSTANCE_NAME} sh -c ': > /etc/openvpn/server/ipp.txt' 2>/dev/null
 
-  # Push docker subnet route to MikroTik so it can reach the CWMP container
-  docker exec ovpn-${INSTANCE_NAME} sh -c "echo 'push \"route ${DOCKER_SUBNET}.0 255.255.255.0\"' >> /etc/openvpn/server/server.conf" 2>/dev/null
+    # Push docker subnet route to MikroTik so it can reach the CWMP container
+    docker exec ovpn-${INSTANCE_NAME} sh -c "echo 'push \"route ${DOCKER_SUBNET}.0 255.255.255.0\"' >> /etc/openvpn/server/server.conf" 2>/dev/null
 
-  docker restart ovpn-${INSTANCE_NAME} >/dev/null
+    docker restart ovpn-${INSTANCE_NAME} >/dev/null
+  else
+    step "L2TP/IPsec selected. Pastikan MikroTik Anda mengkonfigurasi IPsec port forwarding yang benar jika diperlukan."
+  fi
 
   # --- Parameter Restore ---
   # For parameter restore, ACS URL that the ONU reaches is the CWMP Docker Container IP in its network, 
@@ -1092,15 +1253,26 @@ EOF
 
   echo ""
   divider
-  echo -e "  ${C}OpenVPN Connection (Isolasi Cluster):${N}"
-  echo -e "  ${D}Server IP${N} : ${W}$PUBLIC_IP${N}"
-  echo -e "  ${D}Port${N}      : ${W}$PORT_OPENVPN (UDP)${N}"
-  echo -e "  ${D}Tun pool${N}   : ${W}${VPN_POOL_BASE}/24${N} ${D}(allow di RADIUS dari rentang ini; client MikroTik umumnya .2)${N}"
-  echo -e "  ${D}ONU Subnet${N}: ${W}$ONU_SUBNET${N} ${D}(bukan IP VPN)${N}"
-  echo ""
-  echo -e "  ${Y}Download Profile VPN (.ovpn) untuk MikroTik:${N}"
-  echo -e "  ${W}$TARGET_DIR/ovpn-data/client.ovpn${N}"
-  echo -e "  ${D}(Copy file tersebut dan import ke router MikroTik/Client Anda)${N}"
+  if [ "$VPN_CHOICE" == "2" ]; then
+    echo -e "  ${C}L2TP/IPsec Connection (Isolasi Cluster):${N}"
+    echo -e "  ${D}Server IP${N}   : ${W}$PUBLIC_IP${N}"
+    echo -e "  ${D}Ports UDP${N}   : ${W}500->${PORT_IPSEC_500}, 4500->${PORT_IPSEC_4500}${N}"
+    echo -e "  ${D}IPsec PSK${N}   : ${W}${VPN_IPSEC_PSK}${N}"
+    echo -e "  ${D}Username${N}    : ${W}${VPN_USER}${N}"
+    echo -e "  ${D}Password${N}    : ${W}${VPN_PASSWORD}${N}"
+    echo -e "  ${D}Client IP${N}   : ${W}${VPN_POOL_BASE}.10 - .250${N} ${D}(Server L2TP: ${VPN_POOL_BASE}.1)${N}"
+    echo -e "  ${D}ONU Subnet${N}  : ${W}$ONU_SUBNET${N} ${D}(tambahkan static route di MikroTik Anda ke ${DOCKER_SUBNET}.0/24 via interface L2TP)${N}"
+  else
+    echo -e "  ${C}OpenVPN Connection (Isolasi Cluster):${N}"
+    echo -e "  ${D}Server IP${N} : ${W}$PUBLIC_IP${N}"
+    echo -e "  ${D}Port${N}      : ${W}$PORT_OPENVPN (UDP)${N}"
+    echo -e "  ${D}Tun pool${N}   : ${W}${VPN_POOL_BASE}/24${N} ${D}(allow di RADIUS dari rentang ini; client MikroTik umumnya .2)${N}"
+    echo -e "  ${D}ONU Subnet${N}: ${W}$ONU_SUBNET${N} ${D}(bukan IP VPN)${N}"
+    echo ""
+    echo -e "  ${Y}Download Profile VPN (.ovpn) untuk MikroTik:${N}"
+    echo -e "  ${W}$TARGET_DIR/ovpn-data/client.ovpn${N}"
+    echo -e "  ${D}(Copy file tersebut dan import ke router MikroTik/Client Anda)${N}"
+  fi
   echo ""
   echo -e "  ${Y}ACS URL (Set di ONU):${N}"
   echo -e "  ${W}$ACS_URL${N}"
@@ -1429,11 +1601,13 @@ services_menu() {
     clear
     header "SERVICES & SETTINGS"
 
-    local nginx_status certbot_status
+    local nginx_status certbot_status radius_status
     [ -n "$(docker ps -q -f name=mostech-nginx-proxy 2>/dev/null)" ] && \
       nginx_status="${G}Active${N}" || nginx_status="${D}Off${N}"
     docker image inspect certbot/dns-cloudflare >/dev/null 2>&1 && \
       certbot_status="${G}Ready${N}" || certbot_status="${D}Off${N}"
+    [ -n "$(docker ps -q -f name=gacs-central-radius 2>/dev/null)" ] && \
+      radius_status="${G}Active${N}" || radius_status="${D}Off${N}"
 
     local stable_label latest_label
     [ -f "$SOURCE_DIR/stable/package.json" ] && stable_label="${G}Ready${N}" || stable_label="${R}Missing${N}"
@@ -1441,7 +1615,7 @@ services_menu() {
 
     load_config
     echo ""
-    echo -e "  ${D}Nginx:${N} $nginx_status  │  ${D}Certbot:${N} $certbot_status"
+    echo -e "  ${D}Nginx:${N} $nginx_status  │  ${D}Certbot:${N} $certbot_status  │  ${D}RADIUS:${N} $radius_status"
     echo -e "  ${D}Domain:${N} ${W}${BASE_DOMAIN:-none}${N}  │  ${D}SSL:${N} $([ "$SSL_ENABLED" == "true" ] && echo -e "${G}Active${N}" || echo -e "${D}Off${N}")"
     echo -e "  ${D}Source Stable:${N} $stable_label  │  ${D}Source Latest:${N} $latest_label"
     divider
