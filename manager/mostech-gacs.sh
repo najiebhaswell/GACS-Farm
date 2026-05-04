@@ -236,7 +236,7 @@ uninstall_nginx_service() {
 }
 install_radius_service() {
   header "INSTALL CENTRAL RADIUS (daloRADIUS Official)"
-  local RADIUS_DIR="/home/well/GACS-Farm/radius"
+  local RADIUS_DIR="${MAIN_DIR}/radius"
   
   if [ ! -d "$RADIUS_DIR" ]; then
     step "Cloning official daloRADIUS repository..."
@@ -285,7 +285,7 @@ EOF
 
 uninstall_radius_service() {
   header "UNINSTALL CENTRAL RADIUS"
-  local RADIUS_DIR="/home/well/GACS-Farm/radius"
+  local RADIUS_DIR="${MAIN_DIR}/radius"
   if [ -d "$RADIUS_DIR" ]; then
     (cd "$RADIUS_DIR" && $DOCKER_COMPOSE down -v)
     rm -rf "$RADIUS_DIR"
@@ -933,11 +933,7 @@ install_instance() {
     return
   fi
 
-  echo -e "\n${W}Pilih tipe VPN untuk Site-to-ACS:${N}"
-  echo "  1. OpenVPN (Default, port tunggal)"
-  echo "  2. L2TP/IPsec (hwdsl2/docker-ipsec-vpn-server)"
-  read -p "$(echo -e "${B}►${N} Pilihan (1/2): ")" VPN_CHOICE
-  [[ "$VPN_CHOICE" != "2" ]] && VPN_CHOICE=1
+
 
   step "Allocating ports..."
   PORT_CWMP=$(get_random_free_port)
@@ -946,17 +942,8 @@ install_instance() {
   PORT_UI=$(get_random_free_port)
   DOCKER_SUBNET="10.$((RANDOM % 200 + 10)).$((RANDOM % 250))"
 
-  if [ "$VPN_CHOICE" == "2" ]; then
-    PORT_IPSEC_500=$(get_random_free_port)
-    PORT_IPSEC_4500=$(get_random_free_port)
-    VPN_IPSEC_PSK=$(generate_random_password 16)
-    VPN_USER="gacs-${INSTANCE_NAME}"
-    VPN_PASSWORD=$(generate_random_password 12)
-    ok "Ports: CWMP=${W}$PORT_CWMP${N} | NBI=${W}$PORT_NBI${N} | FS=${W}$PORT_FS${N} | UI=${W}$PORT_UI${N} | IPsec=500:${W}$PORT_IPSEC_500${N}, 4500:${W}$PORT_IPSEC_4500${N}"
-  else
-    PORT_OPENVPN=$(get_random_free_port)
-    ok "Ports: CWMP=${W}$PORT_CWMP${N} | NBI=${W}$PORT_NBI${N} | FS=${W}$PORT_FS${N} | UI=${W}$PORT_UI${N} | VPN=${W}$PORT_OPENVPN${N}"
-  fi
+  PORT_OPENVPN=$(get_random_free_port)
+  ok "Ports: CWMP=${W}$PORT_CWMP${N} | NBI=${W}$PORT_NBI${N} | FS=${W}$PORT_FS${N} | UI=${W}$PORT_UI${N} | VPN=${W}$PORT_OPENVPN${N}"
 
   TARGET_DIR="$INSTANCES_DIR/$INSTANCE_NAME"
   mkdir -p "$TARGET_DIR"
@@ -969,9 +956,9 @@ install_instance() {
   # --- ONU Subnet Route ---
   echo ""
   info "Agar ACS bisa manage ONU (summon/push), perlu route ke subnet ONU."
-  read -p "$(echo -e "${B}►${N} Subnet ONU di MikroTik ini (contoh: 10.50.0.0/16): ")" ONU_SUBNET
-  if [[ ! "$ONU_SUBNET" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]]; then
-    err "Format subnet tidak valid! Contoh: 10.50.0.0/16"
+  read -p "$(echo -e "${B}►${N} Subnet ONU di MikroTik ini (contoh: 10.50.0.0/16 atau pisahkan koma: 10.1.0.0/24,10.2.0.0/24): ")" ONU_SUBNET
+  if [[ ! "$ONU_SUBNET" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+(,[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+)*$ ]]; then
+    err "Format subnet tidak valid! Contoh: 10.50.0.0/16 atau 10.1.0.0/24,10.2.0.0/24"
     return
   fi
 
@@ -983,58 +970,24 @@ install_instance() {
 
   PUBLIC_IP=$(get_public_ip)
   load_config
-  if [ "$VPN_CHOICE" == "2" ]; then
+  if [ -n "$BASE_DOMAIN" ]; then
     cat > "$TARGET_DIR/vpn.env" <<EOF
-VPN_IPSEC_PSK=${VPN_IPSEC_PSK}
-VPN_USER=${VPN_USER}
-VPN_PASSWORD=${VPN_PASSWORD}
-VPN_L2TP_NET=${VPN_POOL_BASE}.0/24
-VPN_L2TP_LOCAL=${VPN_POOL_BASE}.1
-VPN_L2TP_POOL=${VPN_POOL_BASE}.10-${VPN_POOL_BASE}.250
-EOF
-  else
-    if [ -n "$BASE_DOMAIN" ]; then
-      cat > "$TARGET_DIR/vpn.env" <<EOF
 VPN_DNS_NAME=acs-${INSTANCE_NAME}.${BASE_DOMAIN}
 VPN_PORT=${PORT_OPENVPN}
 VPN_PROTO=udp
 EOF
-    else
-      cat > "$TARGET_DIR/vpn.env" <<EOF
+  else
+    cat > "$TARGET_DIR/vpn.env" <<EOF
 VPN_PORT=${PORT_OPENVPN}
 VPN_PROTO=udp
 EOF
-    fi
   fi
 
   cat > "$TARGET_DIR/docker-compose.yml" <<EOF
 services:
 EOF
 
-  if [ "$VPN_CHOICE" == "2" ]; then
-    cat >> "$TARGET_DIR/docker-compose.yml" <<EOF
-  ipsec-vpn:
-    image: hwdsl2/ipsec-vpn-server
-    container_name: ipsec-${INSTANCE_NAME}
-    restart: always
-    env_file:
-      - ./vpn.env
-    ports:
-      - "${PORT_IPSEC_500}:500/udp"
-      - "${PORT_IPSEC_4500}:4500/udp"
-    cap_add:
-      - NET_ADMIN
-    privileged: true
-    sysctls:
-      - net.ipv4.ip_forward=1
-      - net.ipv6.conf.all.forwarding=1
-    networks:
-      genieacs-net:
-        ipv4_address: ${DOCKER_SUBNET}.254
-      gacs-radius-net:
-EOF
-  else
-    cat >> "$TARGET_DIR/docker-compose.yml" <<EOF
+  cat >> "$TARGET_DIR/docker-compose.yml" <<EOF
   openvpn:
     image: hwdsl2/openvpn-server
     container_name: ovpn-${INSTANCE_NAME}
@@ -1056,7 +1009,13 @@ EOF
         ipv4_address: ${DOCKER_SUBNET}.254
       gacs-radius-net:
 EOF
-  fi
+
+  local CWMP_ROUTE_CMD=""
+  IFS=',' read -ra ADDR <<< "$ONU_SUBNET"
+  for s in "${ADDR[@]}"; do
+    CWMP_ROUTE_CMD+="ip route add $s via ${DOCKER_SUBNET}.254 && "
+  done
+  CWMP_ROUTE_CMD+="./dist/bin/genieacs-cwmp"
 
   cat >> "$TARGET_DIR/docker-compose.yml" <<EOF
 
@@ -1084,7 +1043,7 @@ EOF
       - mongodb
     cap_add:
       - NET_ADMIN
-    command: sh -c "ip route add ${ONU_SUBNET} via ${DOCKER_SUBNET}.254 && ./dist/bin/genieacs-cwmp"
+    command: sh -c "${CWMP_ROUTE_CMD}"
 
   genieacs-nbi:
     build:
@@ -1145,11 +1104,7 @@ networks:
 EOF
 
   step "Building & starting containers..."
-  if [ "$VPN_CHOICE" == "2" ]; then
-    log_action "INSTALL" "START - '$INSTANCE_NAME' ver=$VERSION | CWMP=$PORT_CWMP NBI=$PORT_NBI FS=$PORT_FS UI=$PORT_UI IPsec=$PORT_IPSEC_500,$PORT_IPSEC_4500"
-  else
-    log_action "INSTALL" "START - '$INSTANCE_NAME' ver=$VERSION | CWMP=$PORT_CWMP NBI=$PORT_NBI FS=$PORT_FS UI=$PORT_UI OVPN=$PORT_OPENVPN"
-  fi
+  log_action "INSTALL" "START - '$INSTANCE_NAME' ver=$VERSION | CWMP=$PORT_CWMP NBI=$PORT_NBI FS=$PORT_FS UI=$PORT_UI OVPN=$PORT_OPENVPN"
   (cd "$TARGET_DIR" && $DOCKER_COMPOSE up -d --build)
   
   step "Menunggu layanan siap (sleep 15s)..."
@@ -1157,57 +1112,61 @@ EOF
 
   generate_nginx_conf "$INSTANCE_NAME" "$PORT_UI" "$PORT_CWMP" "$PORT_NBI" "$PORT_FS"
 
-  if [ "$VPN_CHOICE" == "1" ]; then
-    step "Configuring OpenVPN Client routing (iroute)..."
-    local CIDR=$(echo "$ONU_SUBNET" | cut -d/ -f2)
-    local SUBNET_IP=$(echo "$ONU_SUBNET" | cut -d/ -f1)
-    
+  step "Configuring OpenVPN Client routing (iroute)..."
+  docker exec ovpn-${INSTANCE_NAME} sh -c "mkdir -p /etc/openvpn/ccd" 2>/dev/null
+  docker exec ovpn-${INSTANCE_NAME} sh -c ": > /etc/openvpn/ccd/client" 2>/dev/null
+  
+  IFS=',' read -ra ADDR <<< "$ONU_SUBNET"
+  for s in "${ADDR[@]}"; do
+    local CIDR=$(echo "$s" | cut -d/ -f2)
+    local SUBNET_IP=$(echo "$s" | cut -d/ -f1)
     local full_octets=$((CIDR/8))
     local partial_octet=$((CIDR%8))
     local NETMASK=""
     for ((i=0;i<4;i+=1)); do
-      if [ $i -lt $full_octets ]; then
-        NETMASK+="255"
-      elif [ $i -eq $full_octets ]; then
-        NETMASK+=$((256 - 2**(8-partial_octet)))
-      else
-        NETMASK+="0"
+      if [ $i -lt $full_octets ]; then NETMASK+="255"
+      elif [ $i -eq $full_octets ]; then NETMASK+=$((256 - 2**(8-partial_octet)))
+      else NETMASK+="0"
       fi
       test $i -lt 3 && NETMASK+="."
     done
-
-    docker exec ovpn-${INSTANCE_NAME} sh -c "mkdir -p /etc/openvpn/ccd" 2>/dev/null
-    docker exec ovpn-${INSTANCE_NAME} sh -c "echo 'iroute $SUBNET_IP $NETMASK' > /etc/openvpn/ccd/client" 2>/dev/null
-    docker exec ovpn-${INSTANCE_NAME} sh -c "grep -q 'client-config-dir' /etc/openvpn/server/server.conf || echo 'client-config-dir /etc/openvpn/ccd' >> /etc/openvpn/server/server.conf" 2>/dev/null
+    
+    docker exec ovpn-${INSTANCE_NAME} sh -c "echo 'iroute $SUBNET_IP $NETMASK' >> /etc/openvpn/ccd/client" 2>/dev/null
     docker exec ovpn-${INSTANCE_NAME} sh -c "grep -q 'route $SUBNET_IP' /etc/openvpn/server/server.conf || echo 'route $SUBNET_IP $NETMASK' >> /etc/openvpn/server/server.conf" 2>/dev/null
-    
-    # Fix MikroTik compatibility: disable tls-crypt entirely to prevent auth digest errors
-    docker exec ovpn-${INSTANCE_NAME} sed -i '/tls-crypt tc.key/d' /etc/openvpn/server/server.conf 2>/dev/null
-    docker exec ovpn-${INSTANCE_NAME} sed -i -e '/<tls-crypt>/,/<\/tls-crypt>/d' /etc/openvpn/clients/client.ovpn 2>/dev/null
-    docker exec ovpn-${INSTANCE_NAME} sed -i '/ignore-unknown-option/d' /etc/openvpn/clients/client.ovpn 2>/dev/null
-    
-    # Fix MikroTik null-digest error by switching AEAD cipher (GCM) to CBC
-    docker exec ovpn-${INSTANCE_NAME} sed -i 's/cipher AES-128-GCM/cipher AES-256-CBC\ndata-ciphers AES-256-CBC/g' /etc/openvpn/server/server.conf 2>/dev/null
-    docker exec ovpn-${INSTANCE_NAME} sed -i 's/cipher AES-128-GCM/cipher AES-256-CBC/g' /etc/openvpn/clients/client.ovpn 2>/dev/null
-    
-    # Remove unsupported push options that cause MikroTik to fail getting IP
-    docker exec ovpn-${INSTANCE_NAME} sed -i '/push "redirect-gateway/d' /etc/openvpn/server/server.conf 2>/dev/null
-    docker exec ovpn-${INSTANCE_NAME} sed -i '/push "block-ipv6/d' /etc/openvpn/server/server.conf 2>/dev/null
-    docker exec ovpn-${INSTANCE_NAME} sed -i '/push "ifconfig-ipv6/d' /etc/openvpn/server/server.conf 2>/dev/null
-    docker exec ovpn-${INSTANCE_NAME} sed -i '/push "dhcp-option/d' /etc/openvpn/server/server.conf 2>/dev/null
-    docker exec ovpn-${INSTANCE_NAME} sed -i '/push "block-outside-dns/d' /etc/openvpn/server/server.conf 2>/dev/null
-    
-    # Unique tun /24 per instance (default image uses 10.8.0.0 — replace for RADIUS per-customer allow)
-    docker exec ovpn-${INSTANCE_NAME} sed -i "s|^server[[:space:]].*|server ${VPN_POOL_BASE} 255.255.255.0|" /etc/openvpn/server/server.conf 2>/dev/null
-    docker exec ovpn-${INSTANCE_NAME} sh -c ': > /etc/openvpn/server/ipp.txt' 2>/dev/null
+  done
+  docker exec ovpn-${INSTANCE_NAME} sh -c "grep -q 'client-config-dir' /etc/openvpn/server/server.conf || echo 'client-config-dir /etc/openvpn/ccd' >> /etc/openvpn/server/server.conf" 2>/dev/null
+  
+  # Fix MikroTik compatibility: disable tls-crypt entirely to prevent auth digest errors
+  docker exec ovpn-${INSTANCE_NAME} sed -i '/tls-crypt tc.key/d' /etc/openvpn/server/server.conf 2>/dev/null
+  docker exec ovpn-${INSTANCE_NAME} sed -i -e '/<tls-crypt>/,/<\/tls-crypt>/d' /etc/openvpn/clients/client.ovpn 2>/dev/null
+  docker exec ovpn-${INSTANCE_NAME} sed -i '/ignore-unknown-option/d' /etc/openvpn/clients/client.ovpn 2>/dev/null
+  
+  # Fix MikroTik null-digest error by switching AEAD cipher (GCM) to CBC
+  docker exec ovpn-${INSTANCE_NAME} sed -i 's/cipher AES-128-GCM/cipher AES-256-CBC\ndata-ciphers AES-256-CBC/g' /etc/openvpn/server/server.conf 2>/dev/null
+  docker exec ovpn-${INSTANCE_NAME} sed -i 's/cipher AES-128-GCM/cipher AES-256-CBC/g' /etc/openvpn/clients/client.ovpn 2>/dev/null
+  
+  # Remove unsupported push options that cause MikroTik to fail getting IP
+  docker exec ovpn-${INSTANCE_NAME} sed -i '/push "redirect-gateway/d' /etc/openvpn/server/server.conf 2>/dev/null
+  docker exec ovpn-${INSTANCE_NAME} sed -i '/push "block-ipv6/d' /etc/openvpn/server/server.conf 2>/dev/null
+  docker exec ovpn-${INSTANCE_NAME} sed -i '/push "ifconfig-ipv6/d' /etc/openvpn/server/server.conf 2>/dev/null
+  docker exec ovpn-${INSTANCE_NAME} sed -i '/push "dhcp-option/d' /etc/openvpn/server/server.conf 2>/dev/null
+  docker exec ovpn-${INSTANCE_NAME} sed -i '/push "block-outside-dns/d' /etc/openvpn/server/server.conf 2>/dev/null
+  
+  # Unique tun /24 per instance (default image uses 10.8.0.0 — replace for RADIUS per-customer allow)
+  docker exec ovpn-${INSTANCE_NAME} sed -i "s|^server[[:space:]].*|server ${VPN_POOL_BASE} 255.255.255.0|" /etc/openvpn/server/server.conf 2>/dev/null
+  docker exec ovpn-${INSTANCE_NAME} sh -c ': > /etc/openvpn/server/ipp.txt' 2>/dev/null
 
-    # Push docker subnet route to MikroTik so it can reach the CWMP container
-    docker exec ovpn-${INSTANCE_NAME} sh -c "echo 'push \"route ${DOCKER_SUBNET}.0 255.255.255.0\"' >> /etc/openvpn/server/server.conf" 2>/dev/null
+  # Push docker subnet route to MikroTik so it can reach the CWMP container
+  docker exec ovpn-${INSTANCE_NAME} sh -c "echo 'push \"route ${DOCKER_SUBNET}.0 255.255.255.0\"' >> /etc/openvpn/server/server.conf" 2>/dev/null
 
-    docker restart ovpn-${INSTANCE_NAME} >/dev/null
-  else
-    step "L2TP/IPsec selected. Pastikan MikroTik Anda mengkonfigurasi IPsec port forwarding yang benar jika diperlukan."
-  fi
+  # Fix iptables rules for the custom VPN_POOL_BASE
+  docker exec ovpn-${INSTANCE_NAME} sh -c "echo '#!/bin/sh' > /etc/openvpn/iptables.sh" 2>/dev/null
+  docker exec ovpn-${INSTANCE_NAME} sh -c "echo 'iptables -t nat -A POSTROUTING -s ${VPN_POOL_BASE}/24 -j MASQUERADE' >> /etc/openvpn/iptables.sh" 2>/dev/null
+  docker exec ovpn-${INSTANCE_NAME} sh -c "echo 'iptables -I FORWARD -s ${VPN_POOL_BASE}/24 -j ACCEPT' >> /etc/openvpn/iptables.sh" 2>/dev/null
+  docker exec ovpn-${INSTANCE_NAME} chmod +x /etc/openvpn/iptables.sh 2>/dev/null
+  docker exec ovpn-${INSTANCE_NAME} sh -c "grep -q 'route-up' /etc/openvpn/server/server.conf || echo -e '\nscript-security 2\nroute-up /etc/openvpn/iptables.sh' >> /etc/openvpn/server/server.conf" 2>/dev/null
+
+  docker restart ovpn-${INSTANCE_NAME} >/dev/null
 
   # --- Parameter Restore ---
   # For parameter restore, ACS URL that the ONU reaches is the CWMP Docker Container IP in its network, 
@@ -1228,6 +1187,26 @@ EOF
     else
       info "Skipped parameter restore."
     fi
+  fi
+
+  local NAS_SECRET=""
+  if docker ps -q -f name=radius-mysql | grep -q .; then
+    step "Registering NAS to Central RADIUS..."
+    NAS_SECRET=$(generate_random_password 16)
+    local NAS_IP="${VPN_POOL_BASE}/24"
+    docker exec radius-mysql mysql -u radius -pradiusdbpw radius -e "DELETE FROM nas WHERE nasname='${NAS_IP}'; INSERT INTO nas (nasname, shortname, type, secret, description) VALUES ('${NAS_IP}', '${INSTANCE_NAME}', 'other', '${NAS_SECRET}', 'Auto-generated for ${INSTANCE_NAME}');" 2>/dev/null
+    
+    # Get VPN container IP on gacs-radius-net to handle Docker SNAT
+    local VPN_CONTAINER=""
+    local VPN_CONTAINER="ovpn-${INSTANCE_NAME}"
+    # Try to get the IP on eth1 (usually the second network joined, gacs-radius-net) or fallback to eth0
+    local VPN_NAT_IP=$(docker exec $VPN_CONTAINER ip -4 addr show eth1 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
+    if [ -z "$VPN_NAT_IP" ]; then VPN_NAT_IP=$(docker exec $VPN_CONTAINER ip -4 addr show eth0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1); fi
+    if [ -n "$VPN_NAT_IP" ]; then
+      docker exec radius-mysql mysql -u radius -pradiusdbpw radius -e "DELETE FROM nas WHERE nasname='${VPN_NAT_IP}'; INSERT INTO nas (nasname, shortname, type, secret, description) VALUES ('${VPN_NAT_IP}', '${INSTANCE_NAME}_NAT', 'other', '${NAS_SECRET}', 'NAT IP for ${INSTANCE_NAME}');" 2>/dev/null
+    fi
+
+    echo "RADIUS_NAS_SECRET=${NAS_SECRET}" >> "$TARGET_DIR/vpn.env"
   fi
 
   log_action "INSTALL" "DONE - '$INSTANCE_NAME' deployed"
@@ -1253,26 +1232,19 @@ EOF
 
   echo ""
   divider
-  if [ "$VPN_CHOICE" == "2" ]; then
-    echo -e "  ${C}L2TP/IPsec Connection (Isolasi Cluster):${N}"
-    echo -e "  ${D}Server IP${N}   : ${W}$PUBLIC_IP${N}"
-    echo -e "  ${D}Ports UDP${N}   : ${W}500->${PORT_IPSEC_500}, 4500->${PORT_IPSEC_4500}${N}"
-    echo -e "  ${D}IPsec PSK${N}   : ${W}${VPN_IPSEC_PSK}${N}"
-    echo -e "  ${D}Username${N}    : ${W}${VPN_USER}${N}"
-    echo -e "  ${D}Password${N}    : ${W}${VPN_PASSWORD}${N}"
-    echo -e "  ${D}Client IP${N}   : ${W}${VPN_POOL_BASE}.10 - .250${N} ${D}(Server L2TP: ${VPN_POOL_BASE}.1)${N}"
-    echo -e "  ${D}ONU Subnet${N}  : ${W}$ONU_SUBNET${N} ${D}(tambahkan static route di MikroTik Anda ke ${DOCKER_SUBNET}.0/24 via interface L2TP)${N}"
-  else
-    echo -e "  ${C}OpenVPN Connection (Isolasi Cluster):${N}"
-    echo -e "  ${D}Server IP${N} : ${W}$PUBLIC_IP${N}"
-    echo -e "  ${D}Port${N}      : ${W}$PORT_OPENVPN (UDP)${N}"
-    echo -e "  ${D}Tun pool${N}   : ${W}${VPN_POOL_BASE}/24${N} ${D}(allow di RADIUS dari rentang ini; client MikroTik umumnya .2)${N}"
-    echo -e "  ${D}ONU Subnet${N}: ${W}$ONU_SUBNET${N} ${D}(bukan IP VPN)${N}"
-    echo ""
-    echo -e "  ${Y}Download Profile VPN (.ovpn) untuk MikroTik:${N}"
-    echo -e "  ${W}$TARGET_DIR/ovpn-data/client.ovpn${N}"
-    echo -e "  ${D}(Copy file tersebut dan import ke router MikroTik/Client Anda)${N}"
+  echo -e "  ${C}OpenVPN Connection (Isolasi Cluster):${N}"
+  echo -e "  ${D}Server IP${N} : ${W}$PUBLIC_IP${N}"
+  echo -e "  ${D}Port${N}      : ${W}$PORT_OPENVPN (UDP)${N}"
+  echo -e "  ${D}Tun pool${N}   : ${W}${VPN_POOL_BASE}/24${N} ${D}(allow di RADIUS dari rentang ini; client MikroTik umumnya .2)${N}"
+  echo -e "  ${D}ONU Subnet${N}: ${W}$ONU_SUBNET${N} ${D}(bukan IP VPN)${N}"
+  if [ -n "$NAS_SECRET" ]; then 
+    echo -e "  ${D}RADIUS Server IP${N}: ${W}${DOCKER_SUBNET}.1${N} ${D}(Gunakan IP ini di setting RADIUS MikroTik)${N}"
+    echo -e "  ${D}RADIUS Secret   ${N}: ${W}$NAS_SECRET${N} ${D}(Otomatis terdaftar di DB)${N}"
   fi
+  echo ""
+  echo -e "  ${Y}Download Profile VPN (.ovpn) untuk MikroTik:${N}"
+  echo -e "  ${W}$TARGET_DIR/ovpn-data/client.ovpn${N}"
+  echo -e "  ${D}(Copy file tersebut dan import ke router MikroTik/Client Anda)${N}"
   echo ""
   echo -e "  ${Y}ACS URL (Set di ONU):${N}"
   echo -e "  ${W}$ACS_URL${N}"
@@ -1392,51 +1364,55 @@ update_onu_subnet() {
   fi
 
   [ -n "$CURRENT_SUBNET" ] && info "Subnet saat ini: ${W}$CURRENT_SUBNET${N}"
-  read -p "$(echo -e "${B}►${N} Subnet ONU baru (contoh: 192.168.20.0/24): ")" NEW_ONU_SUBNET
-  if [[ ! "$NEW_ONU_SUBNET" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]]; then
+  read -p "$(echo -e "${B}►${N} Subnet ONU baru (contoh: 192.168.20.0/24 atau pisahkan koma: 10.1.0.0/24,10.2.0.0/24): ")" NEW_ONU_SUBNET
+  if [[ ! "$NEW_ONU_SUBNET" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+(,[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+)*$ ]]; then
     err "Format subnet tidak valid!"; return
   fi
   if [ "$NEW_ONU_SUBNET" == "$CURRENT_SUBNET" ]; then
     warn "Subnet baru sama dengan subnet saat ini."; return
   fi
 
-  local CIDR SUBNET_IP NETMASK
-  CIDR=$(echo "$NEW_ONU_SUBNET" | cut -d/ -f2)
-  SUBNET_IP=$(echo "$NEW_ONU_SUBNET" | cut -d/ -f1)
-
-  local full_octets partial_octet i
-  full_octets=$((CIDR / 8))
-  partial_octet=$((CIDR % 8))
-  NETMASK=""
-  for ((i=0; i<4; i+=1)); do
-    if [ "$i" -lt "$full_octets" ]; then
-      NETMASK+="255"
-    elif [ "$i" -eq "$full_octets" ] && [ "$partial_octet" -ne 0 ]; then
-      NETMASK+=$((256 - 2**(8-partial_octet)))
-    else
-      NETMASK+="0"
-    fi
-    [ "$i" -lt 3 ] && NETMASK+="."
-  done
-
+  local CIDR SUBNET_IP NETMASK full_octets partial_octet i
+  
   step "Updating OpenVPN route..."
   if ! docker ps --format '{{.Names}}' | grep -q "^${OVPN_CONTAINER}$"; then
     err "Container OpenVPN tidak berjalan: $OVPN_CONTAINER"; return
   fi
   docker exec "$OVPN_CONTAINER" sh -c "mkdir -p /etc/openvpn/ccd" 2>/dev/null
-  docker exec "$OVPN_CONTAINER" sh -c "echo 'iroute $SUBNET_IP $NETMASK' > /etc/openvpn/ccd/client" 2>/dev/null
+  docker exec "$OVPN_CONTAINER" sh -c ": > /etc/openvpn/ccd/client" 2>/dev/null
   docker exec "$OVPN_CONTAINER" sed -i '/^route [0-9]/d' /etc/openvpn/server/server.conf 2>/dev/null
-  docker exec "$OVPN_CONTAINER" sh -c "echo 'route $SUBNET_IP $NETMASK' >> /etc/openvpn/server/server.conf" 2>/dev/null
+
+  IFS=',' read -ra ADDR <<< "$NEW_ONU_SUBNET"
+  for s in "${ADDR[@]}"; do
+    CIDR=$(echo "$s" | cut -d/ -f2)
+    SUBNET_IP=$(echo "$s" | cut -d/ -f1)
+    full_octets=$((CIDR / 8))
+    partial_octet=$((CIDR % 8))
+    NETMASK=""
+    for ((i=0; i<4; i+=1)); do
+      if [ "$i" -lt "$full_octets" ]; then NETMASK+="255"
+      elif [ "$i" -eq "$full_octets" ] && [ "$partial_octet" -ne 0 ]; then NETMASK+=$((256 - 2**(8-partial_octet)))
+      else NETMASK+="0"
+      fi
+      [ "$i" -lt 3 ] && NETMASK+="."
+    done
+    docker exec "$OVPN_CONTAINER" sh -c "echo 'iroute $SUBNET_IP $NETMASK' >> /etc/openvpn/ccd/client" 2>/dev/null
+    docker exec "$OVPN_CONTAINER" sh -c "echo 'route $SUBNET_IP $NETMASK' >> /etc/openvpn/server/server.conf" 2>/dev/null
+  done
   docker restart "$OVPN_CONTAINER" >/dev/null 2>&1
   ok "OpenVPN route updated (${NEW_ONU_SUBNET})."
 
   step "Updating CWMP startup route..."
-  sed -i -E "s|ip route add [0-9.]+/[0-9]+ via ${DOCKER_GATEWAY} && \./dist/bin/genieacs-cwmp|ip route add ${NEW_ONU_SUBNET} via ${DOCKER_GATEWAY} \&\& ./dist/bin/genieacs-cwmp|g" "$COMPOSE_FILE"
+  local CWMP_ROUTE_CMD=""
+  for s in "${ADDR[@]}"; do
+    CWMP_ROUTE_CMD+="ip route add $s via ${DOCKER_GATEWAY} \&\& "
+  done
+  CWMP_ROUTE_CMD+="./dist/bin/genieacs-cwmp"
+  sed -i -E "s|ip route add .* \./dist/bin/genieacs-cwmp|${CWMP_ROUTE_CMD}|g" "$COMPOSE_FILE"
 
   # Apply immediately in running container (best effort) before recreate.
   if docker ps --format '{{.Names}}' | grep -q "^${CWMP_CONTAINER}$"; then
-    [ -n "$CURRENT_SUBNET" ] && docker exec "$CWMP_CONTAINER" ip route del "$CURRENT_SUBNET" 2>/dev/null || true
-    docker exec "$CWMP_CONTAINER" ip route replace "$NEW_ONU_SUBNET" via "$DOCKER_GATEWAY" 2>/dev/null || true
+    docker restart "$CWMP_CONTAINER" >/dev/null 2>&1 || true
   fi
 
   (cd "$TARGET_DIR" && $DOCKER_COMPOSE up -d --no-deps genieacs-cwmp >/dev/null 2>&1)
@@ -1470,6 +1446,12 @@ uninstall_instance() {
     cd /
     remove_nginx_conf "$INSTANCE_NAME"
     rm -rf "$TARGET_DIR"
+    
+    if docker ps -q -f name=radius-mysql | grep -q .; then
+      step "Removing NAS entries from Central RADIUS..."
+      docker exec radius-mysql mysql -u radius -pradiusdbpw radius -e "DELETE FROM nas WHERE shortname='${INSTANCE_NAME}' OR shortname='${INSTANCE_NAME}_NAT';" 2>/dev/null
+    fi
+    
     log_action "UNINSTALL" "'$INSTANCE_NAME' fully removed"
     ok "$INSTANCE_NAME deleted."
   else
