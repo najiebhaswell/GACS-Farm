@@ -554,6 +554,7 @@ services:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
       - ./conf.d:/etc/nginx/conf.d:ro
       - ./ssl:/etc/letsencrypt:ro
+      - ../../instances:/instances:ro
 DCOMPOSE
 
   ok "Nginx reconfigured with SSL."
@@ -618,6 +619,7 @@ services:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
       - ./conf.d:/etc/nginx/conf.d:ro
       - ./ssl:/etc/letsencrypt:ro
+      - ../../instances:/instances:ro
 DCOMPOSE
     else
       cat > "$NGINX_DIR/docker-compose.yml" <<'DCOMPOSE'
@@ -633,6 +635,7 @@ services:
     volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
       - ./conf.d:/etc/nginx/conf.d:ro
+      - ../../instances:/instances:ro
 DCOMPOSE
     fi
     ok "Nginx compose created."
@@ -682,6 +685,11 @@ server {
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
     }
+    location /vpn-profile {
+        alias /instances/${instance_name}/ovpn-data/client.ovpn;
+        default_type application/x-openvpn-profile;
+        add_header Content-Disposition 'attachment; filename="${instance_name}-vpn.ovpn"';
+    }
 }
 server {
     listen 80;
@@ -728,6 +736,11 @@ server {
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+    location /vpn-profile {
+        alias /instances/${instance_name}/ovpn-data/client.ovpn;
+        default_type application/x-openvpn-profile;
+        add_header Content-Disposition 'attachment; filename="${instance_name}-vpn.ovpn"';
     }
 }
 server {
@@ -788,10 +801,10 @@ regenerate_all_nginx_confs() {
     local cf="$dir/docker-compose.yml"
     if [ -f "$cf" ]; then
       local p_cwmp p_nbi p_fs p_ui
-      p_cwmp=$(grep -A1 'genieacs-cwmp' "$cf" | grep -oP '\d+(?=:7547)' | head -1)
-      p_nbi=$(grep -A1 'genieacs-nbi' "$cf" | grep -oP '\d+(?=:7557)' | head -1)
-      p_fs=$(grep -A1 'genieacs-fs' "$cf" | grep -oP '\d+(?=:7567)' | head -1)
-      p_ui=$(grep -A1 'genieacs-ui' "$cf" | grep -oP '\d+(?=:3000)' | head -1)
+      p_cwmp=$(grep -A15 'genieacs-cwmp' "$cf" | grep -oP '\d+(?=:7547)' | head -1)
+      p_nbi=$(grep -A15 'genieacs-nbi' "$cf" | grep -oP '\d+(?=:7557)' | head -1)
+      p_fs=$(grep -A15 'genieacs-fs' "$cf" | grep -oP '\d+(?=:7567)' | head -1)
+      p_ui=$(grep -A15 'genieacs-ui' "$cf" | grep -oP '\d+(?=:3000)' | head -1)
       [ -n "$p_ui" ] && generate_nginx_conf "$name" "$p_ui" "$p_cwmp" "$p_nbi" "$p_fs" && ok "$name"
     fi
   done
@@ -1010,12 +1023,11 @@ EOF
       gacs-radius-net:
 EOF
 
-  local CWMP_ROUTE_CMD=""
+  local COMMON_ROUTE_CMD=""
   IFS=',' read -ra ADDR <<< "$ONU_SUBNET"
   for s in "${ADDR[@]}"; do
-    CWMP_ROUTE_CMD+="ip route add $s via ${DOCKER_SUBNET}.254 && "
+    COMMON_ROUTE_CMD+="ip route add $s via ${DOCKER_SUBNET}.254 && "
   done
-  CWMP_ROUTE_CMD+="./dist/bin/genieacs-cwmp"
 
   cat >> "$TARGET_DIR/docker-compose.yml" <<EOF
 
@@ -1043,7 +1055,7 @@ EOF
       - mongodb
     cap_add:
       - NET_ADMIN
-    command: sh -c "${CWMP_ROUTE_CMD}"
+    command: sh -c "${COMMON_ROUTE_CMD} ./dist/bin/genieacs-cwmp"
 
   genieacs-nbi:
     build:
@@ -1058,7 +1070,9 @@ EOF
       - genieacs-net
     depends_on:
       - mongodb
-    command: ./dist/bin/genieacs-nbi
+    cap_add:
+      - NET_ADMIN
+    command: sh -c "${COMMON_ROUTE_CMD} ./dist/bin/genieacs-nbi"
 
   genieacs-fs:
     build:
@@ -1073,7 +1087,9 @@ EOF
       - genieacs-net
     depends_on:
       - mongodb
-    command: ./dist/bin/genieacs-fs
+    cap_add:
+      - NET_ADMIN
+    command: sh -c "${COMMON_ROUTE_CMD} ./dist/bin/genieacs-fs"
 
   genieacs-ui:
     build:
@@ -1089,7 +1105,9 @@ EOF
       - genieacs-net
     depends_on:
       - mongodb
-    command: ./dist/bin/genieacs-ui
+    cap_add:
+      - NET_ADMIN
+    command: sh -c "${COMMON_ROUTE_CMD} ./dist/bin/genieacs-ui"
 
 volumes:
   mongo-data:
@@ -1160,9 +1178,28 @@ EOF
   docker exec ovpn-${INSTANCE_NAME} sh -c "echo 'push \"route ${DOCKER_SUBNET}.0 255.255.255.0\"' >> /etc/openvpn/server/server.conf" 2>/dev/null
 
   # Fix iptables rules for the custom VPN_POOL_BASE
-  docker exec ovpn-${INSTANCE_NAME} sh -c "echo '#!/bin/sh' > /etc/openvpn/iptables.sh" 2>/dev/null
-  docker exec ovpn-${INSTANCE_NAME} sh -c "echo 'iptables -t nat -A POSTROUTING -s ${VPN_POOL_BASE}/24 -j MASQUERADE' >> /etc/openvpn/iptables.sh" 2>/dev/null
-  docker exec ovpn-${INSTANCE_NAME} sh -c "echo 'iptables -I FORWARD -s ${VPN_POOL_BASE}/24 -j ACCEPT' >> /etc/openvpn/iptables.sh" 2>/dev/null
+  # NOTE: Target is 'radius' (FreeRADIUS container), NOT 'radius-mysql' (MariaDB)
+  # MASQUERADE to radius ensures the reply path works via conntrack (Bug fix #2 & #3)
+  docker exec ovpn-${INSTANCE_NAME} sh -c "cat > /etc/openvpn/iptables.sh << 'IPTS'
+#!/bin/sh
+# Allow VPN pool traffic to forward
+iptables -t nat -A POSTROUTING -s ${VPN_POOL_BASE}/24 -j MASQUERADE
+iptables -I FORWARD -s ${VPN_POOL_BASE}/24 -j ACCEPT
+
+# Resolve FreeRADIUS container IP (container name: 'radius', NOT 'radius-mysql')
+RAD_IP=\$(getent hosts radius 2>/dev/null | awk '{print \$1}')
+[ -z \"\$RAD_IP\" ] && RAD_IP=\$(nslookup radius 2>/dev/null | awk '/^Address: /{print \$2}' | head -1)
+
+if [ -n \"\$RAD_IP\" ]; then
+  # DNAT: forward MikroTik RADIUS requests (sent to docker gateway) to FreeRADIUS
+  iptables -t nat -A PREROUTING -d ${DOCKER_SUBNET}.1 -p udp --dport 1812 -j DNAT --to-destination \$RAD_IP:1812
+  iptables -t nat -A PREROUTING -d ${DOCKER_SUBNET}.1 -p udp --dport 1813 -j DNAT --to-destination \$RAD_IP:1813
+  # MASQUERADE outgoing to RADIUS so reply comes back via conntrack (not dropped)
+  iptables -t nat -A POSTROUTING -d \$RAD_IP -p udp --dport 1812 -j MASQUERADE
+  iptables -t nat -A POSTROUTING -d \$RAD_IP -p udp --dport 1813 -j MASQUERADE
+  iptables -I FORWARD -d \$RAD_IP -j ACCEPT
+fi
+IPTS" 2>/dev/null
   docker exec ovpn-${INSTANCE_NAME} chmod +x /etc/openvpn/iptables.sh 2>/dev/null
   docker exec ovpn-${INSTANCE_NAME} sh -c "grep -q 'route-up' /etc/openvpn/server/server.conf || echo -e '\nscript-security 2\nroute-up /etc/openvpn/iptables.sh' >> /etc/openvpn/server/server.conf" 2>/dev/null
 
@@ -1195,16 +1232,22 @@ EOF
     NAS_SECRET=$(generate_random_password 16)
     local NAS_IP="${VPN_POOL_BASE}/24"
     docker exec radius-mysql mysql -u radius -pradiusdbpw radius -e "DELETE FROM nas WHERE nasname='${NAS_IP}'; INSERT INTO nas (nasname, shortname, type, secret, description) VALUES ('${NAS_IP}', '${INSTANCE_NAME}', 'other', '${NAS_SECRET}', 'Auto-generated for ${INSTANCE_NAME}');" 2>/dev/null
+    # Also update the broad Docker subnet entry so its secret always matches, preventing FreeRADIUS
+    # from returning a wrong Authenticator when it matches the /16 catch-all before the specific IP entry.
+    docker exec radius-mysql mysql -u radius -pradiusdbpw radius -e "UPDATE nas SET secret='${NAS_SECRET}' WHERE nasname='172.19.0.0/16';" 2>/dev/null
     
     # Get VPN container IP on gacs-radius-net to handle Docker SNAT
     local VPN_CONTAINER=""
     local VPN_CONTAINER="ovpn-${INSTANCE_NAME}"
     # Try to get the IP on eth1 (usually the second network joined, gacs-radius-net) or fallback to eth0
-    local VPN_NAT_IP=$(docker exec $VPN_CONTAINER ip -4 addr show eth1 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
-    if [ -z "$VPN_NAT_IP" ]; then VPN_NAT_IP=$(docker exec $VPN_CONTAINER ip -4 addr show eth0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1); fi
+    local VPN_NAT_IP=$(docker inspect -f '{{ (index .NetworkSettings.Networks "gacs-radius-net").IPAddress }}' "$VPN_CONTAINER" 2>/dev/null)
     if [ -n "$VPN_NAT_IP" ]; then
       docker exec radius-mysql mysql -u radius -pradiusdbpw radius -e "DELETE FROM nas WHERE nasname='${VPN_NAT_IP}'; INSERT INTO nas (nasname, shortname, type, secret, description) VALUES ('${VPN_NAT_IP}', '${INSTANCE_NAME}_NAT', 'other', '${NAS_SECRET}', 'NAT IP for ${INSTANCE_NAME}');" 2>/dev/null
     fi
+
+    # Restart FreeRADIUS so it reloads the NAS table from database
+    docker restart radius >/dev/null 2>&1 || true
+    ok "NAS registered & FreeRADIUS reloaded."
 
     echo "RADIUS_NAS_SECRET=${NAS_SECRET}" >> "$TARGET_DIR/vpn.env"
   fi
@@ -1450,6 +1493,7 @@ uninstall_instance() {
     if docker ps -q -f name=radius-mysql | grep -q .; then
       step "Removing NAS entries from Central RADIUS..."
       docker exec radius-mysql mysql -u radius -pradiusdbpw radius -e "DELETE FROM nas WHERE shortname='${INSTANCE_NAME}' OR shortname='${INSTANCE_NAME}_NAT';" 2>/dev/null
+      docker restart radius >/dev/null 2>&1 || true
     fi
     
     log_action "UNINSTALL" "'$INSTANCE_NAME' fully removed"
@@ -1492,6 +1536,93 @@ view_logs() {
   esac
 }
 
+view_instance_info() {
+  header "VIEW INSTANCE INFO"
+  if ! list_instances; then return; fi
+  if ! select_instance "Pilih nomor instance:"; then return; fi
+
+  local INSTANCE_NAME="$SELECTED_INSTANCE"
+  local TARGET_DIR="$INSTANCES_DIR/$INSTANCE_NAME"
+  local CF="$TARGET_DIR/docker-compose.yml"
+  local ENV_FILE="$TARGET_DIR/vpn.env"
+  
+  if [ ! -f "$CF" ]; then
+    err "File konfigurasi tidak ditemukan."
+    return
+  fi
+
+  local p_cwmp p_nbi p_fs p_ui
+  p_cwmp=$(grep -A15 'genieacs-cwmp' "$CF" | grep -oP '\d+(?=:7547)' | head -1)
+  p_nbi=$(grep -A15 'genieacs-nbi' "$CF" | grep -oP '\d+(?=:7557)' | head -1)
+  p_fs=$(grep -A15 'genieacs-fs' "$CF" | grep -oP '\d+(?=:7567)' | head -1)
+  p_ui=$(grep -A15 'genieacs-ui' "$CF" | grep -oP '\d+(?=:3000)' | head -1)
+
+  local DOCKER_SUBNET_CIDR=$(grep -oP '(?<=subnet:\s)[0-9]+\.[0-9]+\.[0-9]+\.0/24' "$CF" | head -1)
+  local DOCKER_SUBNET=$(echo "$DOCKER_SUBNET_CIDR" | cut -d'.' -f1-3)
+
+  local ONU_SUBNET=""
+  if [ -f "$TARGET_DIR/.onu_subnet" ]; then
+    ONU_SUBNET=$(cat "$TARGET_DIR/.onu_subnet")
+  else
+    ONU_SUBNET=$(grep -oP 'ip route add \K[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+' "$CF" | paste -sd ',' -)
+  fi
+
+  local VPN_POOL_BASE=""
+  if [ -f "$TARGET_DIR/.vpn_tun_pool" ]; then
+    VPN_POOL_BASE=$(cat "$TARGET_DIR/.vpn_tun_pool" | cut -d/ -f1)
+  fi
+
+  local PORT_OPENVPN=""
+  local NAS_SECRET=""
+  if [ -f "$ENV_FILE" ]; then
+    PORT_OPENVPN=$(grep '^VPN_PORT=' "$ENV_FILE" | cut -d= -f2)
+    NAS_SECRET=$(grep '^RADIUS_NAS_SECRET=' "$ENV_FILE" | cut -d= -f2)
+  fi
+
+  local PUBLIC_IP=$(get_public_ip)
+  load_config
+
+  divider
+  echo -e "${G}  ✔ Detail Instance '${W}$INSTANCE_NAME${G}'${N}"
+  divider
+
+  if [ -n "$BASE_DOMAIN" ]; then
+    echo ""
+    if [ "$SSL_ENABLED" == "true" ]; then
+      echo -e "  ${C}Web UI${N}  : ${W}https://acs-${INSTANCE_NAME}.${BASE_DOMAIN}${N}"
+    else
+      echo -e "  ${C}Web UI${N}  : ${W}http://acs-${INSTANCE_NAME}.${BASE_DOMAIN}${N}"
+    fi
+    echo -e "  ${C}CWMP${N}    : http://cwmp-${INSTANCE_NAME}.${BASE_DOMAIN}"
+    echo -e "  ${C}NBI${N}     : http://nbi-${INSTANCE_NAME}.${BASE_DOMAIN}"
+    echo -e "  ${C}FS${N}      : http://fs-${INSTANCE_NAME}.${BASE_DOMAIN}"
+  fi
+
+  echo -e "\n  ${D}Direct access (IP:PORT):${N}"
+  echo -e "  ${D}UI=:$p_ui | CWMP=:$p_cwmp | NBI=:$p_nbi | FS=:$p_fs${N}"
+
+  echo ""
+  divider
+  echo -e "  ${C}OpenVPN Connection (Isolasi Cluster):${N}"
+  echo -e "  ${D}Server IP${N} : ${W}$PUBLIC_IP${N}"
+  echo -e "  ${D}Port${N}      : ${W}$PORT_OPENVPN (UDP)${N}"
+  echo -e "  ${D}Tun pool${N}   : ${W}${VPN_POOL_BASE}/24${N}"
+  echo -e "  ${D}ONU Subnet${N}: ${W}$ONU_SUBNET${N}"
+  if [ -n "$NAS_SECRET" ]; then 
+    echo -e "  ${D}RADIUS Server IP${N}: ${W}${DOCKER_SUBNET}.1${N} ${D}(Gunakan IP ini di setting RADIUS MikroTik)${N}"
+    echo -e "  ${D}RADIUS Secret   ${N}: ${W}$NAS_SECRET${N}"
+  fi
+  echo ""
+  echo -e "  ${Y}Download Profile VPN (.ovpn):${N}"
+  echo -e "  ${W}$TARGET_DIR/ovpn-data/client.ovpn${N}"
+  echo ""
+  echo -e "  ${Y}ACS URL (Set di ONU):${N}"
+  local ACS_URL="http://${DOCKER_SUBNET}.100:7547"
+  if [ -n "$BASE_DOMAIN" ]; then ACS_URL="http://cwmp-${INSTANCE_NAME}.${BASE_DOMAIN}"; fi
+  echo -e "  ${W}$ACS_URL${N}"
+  divider
+}
+
 # ╔══════════════════════════════════════╗
 # ║       INSTANCE MANAGEMENT MENU       ║
 # ╚══════════════════════════════════════╝
@@ -1507,25 +1638,27 @@ manage_instance_menu() {
     divider
 
     echo -e "  ${C}▸${N} ${W}1${N}  🆕  Install New Instance"
-    echo -e "  ${C}▸${N} ${W}2${N}  📊  Monitor Resources"
-    echo -e "  ${C}▸${N} ${W}3${N}  ⏸️   Pause / Unpause"
-    echo -e "  ${C}▸${N} ${W}4${N}  🗑️   Uninstall Instance"
-    echo -e "  ${C}▸${N} ${W}5${N}  🔁  Update ONU Subnet"
+    echo -e "  ${C}▸${N} ${W}2${N}  ℹ️   View Instance Info"
+    echo -e "  ${C}▸${N} ${W}3${N}  📊  Monitor Resources"
+    echo -e "  ${C}▸${N} ${W}4${N}  ⏸️   Pause / Unpause"
+    echo -e "  ${C}▸${N} ${W}5${N}  🗑️   Uninstall Instance"
+    echo -e "  ${C}▸${N} ${W}6${N}  🔁  Update ONU Subnet"
     echo -e "  ${C}▸${N} ${W}0${N}  ↩️   Back"
     divider
     read -p "$(echo -e "${B}►${N} Pilihan: ")" INST_MENU
 
     case $INST_MENU in
       1) install_instance ;;
-      2) monitor_instance ;;
-      3) pause_instance ;;
-      4) uninstall_instance ;;
-      5) update_onu_subnet ;;
+      2) view_instance_info ;;
+      3) monitor_instance ;;
+      4) pause_instance ;;
+      5) uninstall_instance ;;
+      6) update_onu_subnet ;;
       0) return ;;
       *) err "Invalid option." ;;
     esac
 
-    [ "$INST_MENU" != "2" ] && { echo ""; read -p "$(echo -e "${D}Press Enter to continue...${N}")"; }
+    [ "$INST_MENU" != "3" ] && { echo ""; read -p "$(echo -e "${D}Press Enter to continue...${N}")"; }
   done
 }
 
