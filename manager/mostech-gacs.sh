@@ -1286,7 +1286,14 @@ IPTS" 2>/dev/null
   fi
   echo ""
   echo -e "  ${Y}Download Profile VPN (.ovpn) untuk MikroTik:${N}"
-  echo -e "  ${W}$TARGET_DIR/ovpn-data/client.ovpn${N}"
+  if [ -n "$BASE_DOMAIN" ]; then
+    if [ "$SSL_ENABLED" == "true" ]; then
+      echo -e "  ${W}https://acs-${INSTANCE_NAME}.${BASE_DOMAIN}/vpn-profile${N}"
+    else
+      echo -e "  ${W}http://acs-${INSTANCE_NAME}.${BASE_DOMAIN}/vpn-profile${N}"
+    fi
+  fi
+  echo -e "  ${D}Lokal:${N} ${W}$TARGET_DIR/ovpn-data/client.ovpn${N}"
   echo -e "  ${D}(Copy file tersebut dan import ke router MikroTik/Client Anda)${N}"
   echo ""
   echo -e "  ${Y}ACS URL (Set di ONU):${N}"
@@ -1488,6 +1495,13 @@ uninstall_instance() {
     $DOCKER_COMPOSE down -v --rmi all
     cd /
     remove_nginx_conf "$INSTANCE_NAME"
+    
+    # Remove VPN profile from HTTP server (ovpn-data directory)
+    if [ -d "$TARGET_DIR/ovpn-data" ]; then
+      rm -rf "$TARGET_DIR/ovpn-data"
+      info "VPN profile files removed."
+    fi
+    
     rm -rf "$TARGET_DIR"
     
     if docker ps -q -f name=radius-mysql | grep -q .; then
@@ -1614,7 +1628,14 @@ view_instance_info() {
   fi
   echo ""
   echo -e "  ${Y}Download Profile VPN (.ovpn):${N}"
-  echo -e "  ${W}$TARGET_DIR/ovpn-data/client.ovpn${N}"
+  if [ -n "$BASE_DOMAIN" ]; then
+    if [ "$SSL_ENABLED" == "true" ]; then
+      echo -e "  ${W}https://acs-${INSTANCE_NAME}.${BASE_DOMAIN}/vpn-profile${N}"
+    else
+      echo -e "  ${W}http://acs-${INSTANCE_NAME}.${BASE_DOMAIN}/vpn-profile${N}"
+    fi
+  fi
+  echo -e "  ${D}Lokal:${N} ${W}$TARGET_DIR/ovpn-data/client.ovpn${N}"
   echo ""
   echo -e "  ${Y}ACS URL (Set di ONU):${N}"
   local ACS_URL="http://${DOCKER_SUBNET}.100:7547"
