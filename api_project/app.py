@@ -2,14 +2,16 @@ import os
 from flask import Flask, request, jsonify, render_template_string
 from flask_cors import CORS
 from datetime import datetime
+from gacs_manager import manager as gacs_manager
 
 app = Flask(__name__)
 CORS(app)
 
 # Get port from environment variable or use default 5000
-PORT = int(os.environ.get('API_PORT', 8080))
+PORT = int(os.environ.get('API_PORT', 5000))
+HOST = os.environ.get('API_HOST', '0.0.0.0')
 
-# In-memory database
+# In-memory database (untuk backward compatibility)
 db = {
     "customers": [],
     "vpns": [],
@@ -431,78 +433,123 @@ def get_customer(customer_id):
 
 @app.route('/api/customers', methods=['POST'])
 def create_customer():
-    """Create new customer"""
-    global customer_id_counter
+    """Create new customer/instance with GenieACS and OpenVPN"""
     data = request.get_json()
     
     if not data or 'name' not in data:
         return jsonify({"success": False, "error": "Field 'name' is required"}), 400
     
-    customer_id_counter += 1
-    customer = {
-        "id": customer_id_counter,
-        "name": data["name"],
-        "description": data.get("description", ""),
-        "ip_address": data.get("ip_address", ""),
-        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "vpn_count": 0
-    }
-    db["customers"].append(customer)
-    
-    return jsonify({"success": True, "message": "Customer created successfully", "data": customer}), 201
+    try:
+        # Call GACS Manager to create instance
+        result = gacs_manager.create_customer_instance(
+            instance_name=data["name"],
+            version=data.get("version", "stable"),
+            onu_subnet=data.get("onu_subnet", ""),
+            base_domain=data.get("base_domain"),
+            ssl_enabled=data.get("ssl_enabled", False)
+        )
+        
+        return jsonify({
+            "success": True, 
+            "message": "Customer instance created successfully with Docker containers",
+            "data": result
+        }), 201
+        
+    except ValueError as e:
+        return jsonify({"success": False, "error": str(e)}), 400
+    except RuntimeError as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+    except Exception as e:
+        return jsonify({"success": False, "error": f"Unexpected error: {str(e)}"}), 500
 
 @app.route('/api/customers/<int:customer_id>', methods=['DELETE'])
 def delete_customer(customer_id):
-    """Delete customer and all related VPNs and routes"""
-    customer = next((c for c in db["customers"] if c["id"] == customer_id), None)
-    if not customer:
-        return jsonify({"success": False, "error": "Customer not found"}), 404
-    
-    # Get all VPNs for this customer
-    vpn_ids = [v["id"] for v in db["vpns"] if v["customer_id"] == customer_id]
-    
-    # Delete all routes for these VPNs
-    db["routes"] = [r for r in db["routes"] if r["vpn_id"] not in vpn_ids]
-    
-    # Delete all VPNs for this customer
-    db["vpns"] = [v for v in db["vpns"] if v["customer_id"] != customer_id]
-    
-    # Delete customer
-    db["customers"] = [c for c in db["customers"] if c["id"] != customer_id]
-    
-    return jsonify({
-        "success": True, 
-        "message": "Customer and all related VPNs/routes deleted successfully",
-        "deleted_vpn_count": len(vpn_ids)
-    })
+    """Delete customer instance and all associated Docker resources"""
+    try:
+        # Get customer name from in-memory db or instances directory
+        customer = next((c for c in db["customers"] if c["id"] == customer_id), None)
+        
+        if not customer:
+            return jsonify({"success": False, "error": "Customer not found"}), 404
+        
+        instance_name = customer.get("name") or customer.get("instance_name")
+        if not instance_name:
+            return jsonify({"success": False, "error": "Customer name not found"}), 404
+        
+        # Call GACS Manager to delete instance
+        result = gacs_manager.delete_customer_instance(instance_name)
+        
+        # Remove from in-memory db
+        db["customers"] = [c for c in db["customers"] if c["id"] != customer_id]
+        vpn_ids = [v["id"] for v in db["vpns"] if v["customer_id"] == customer_id]
+        db["routes"] = [r for r in db["routes"] if r["vpn_id"] not in vpn_ids]
+        db["vpns"] = [v for v in db["vpns"] if v["customer_id"] != customer_id]
+        
+        return jsonify({
+            "success": True, 
+            "message": "Customer instance deleted successfully",
+            "data": result
+        })
+        
+    except ValueError as e:
+        return jsonify({"success": False, "error": str(e)}), 404
+    except Exception as e:
+        return jsonify({"success": False, "error": f"Error deleting instance: {str(e)}"}), 500
 
 # ==================== VPNS API ====================
 @app.route('/api/customers/<int:customer_id>/vpns', methods=['POST'])
 def create_vpn(customer_id):
-    """Create new VPN for customer"""
-    global vpn_id_counter
+    """Add VPN route configuration for existing customer instance"""
+    data = request.get_json()
+    
+    if not data or 'name' not in data:
+        return jsonify({"success": False, "error": "Field 'name' is required"}), 400
+    
+    # Get customer name from in-memory db
     customer = next((c for c in db["customers"] if c["id"] == customer_id), None)
     if not customer:
         return jsonify({"success": False, "error": "Customer not found"}), 404
     
-    data = request.get_json()
-    if not data or 'name' not in data:
-        return jsonify({"success": False, "error": "Field 'name' is required"}), 400
+    instance_name = customer.get("name") or customer.get("instance_name")
     
-    vpn_id_counter += 1
-    vpn = {
-        "id": vpn_id_counter,
-        "customer_id": customer_id,
-        "customer_name": customer["name"],
-        "name": data["name"],
-        "type": data.get("type", "openvpn"),
-        "network": data.get("network", ""),
-        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "route_count": 0
-    }
-    db["vpns"].append(vpn)
-    
-    return jsonify({"success": True, "message": "VPN created successfully", "data": vpn}), 201
+    try:
+        # Add routes to existing OpenVPN instance
+        routes_to_add = []
+        if 'routes' in data and isinstance(data['routes'], list):
+            routes_to_add = data['routes']
+        elif 'network' in data:
+            routes_to_add = [data['network']]
+        
+        result = gacs_manager.add_vpn_for_customer(
+            instance_name=instance_name,
+            additional_routes=routes_to_add if routes_to_add else None
+        )
+        
+        # Store in-memory for UI tracking
+        global vpn_id_counter
+        vpn_id_counter += 1
+        vpn = {
+            "id": vpn_id_counter,
+            "customer_id": customer_id,
+            "customer_name": customer["name"],
+            "name": data["name"],
+            "type": data.get("type", "openvpn"),
+            "network": data.get("network", ""),
+            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "route_count": len(routes_to_add) if routes_to_add else 0
+        }
+        db["vpns"].append(vpn)
+        
+        return jsonify({
+            "success": True, 
+            "message": "VPN routes added to customer instance",
+            "data": {**result, "vpn_record": vpn}
+        }), 201
+        
+    except ValueError as e:
+        return jsonify({"success": False, "error": str(e)}), 404
+    except Exception as e:
+        return jsonify({"success": False, "error": f"Error adding VPN: {str(e)}"}), 500
 
 @app.route('/api/vpns', methods=['GET'])
 def get_all_vpns():
@@ -541,8 +588,7 @@ def delete_vpn(vpn_id):
 # ==================== ROUTES API ====================
 @app.route('/api/vpns/<int:vpn_id>/routes', methods=['POST'])
 def create_route(vpn_id):
-    """Create new route for VPN"""
-    global route_id_counter
+    """Add route to customer VPN instance"""
     vpn = next((v for v in db["vpns"] if v["id"] == vpn_id), None)
     if not vpn:
         return jsonify({"success": False, "error": "VPN not found"}), 404
@@ -550,22 +596,45 @@ def create_route(vpn_id):
     data = request.get_json()
     if not data or 'destination' not in data:
         return jsonify({"success": False, "error": "Field 'destination' is required"}), 400
-    if 'gateway' not in data:
-        return jsonify({"success": False, "error": "Field 'gateway' is required"}), 400
     
-    route_id_counter += 1
-    route = {
-        "id": route_id_counter,
-        "vpn_id": vpn_id,
-        "vpn_name": vpn["name"],
-        "destination": data["destination"],
-        "gateway": data["gateway"],
-        "description": data.get("description", ""),
-        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    }
-    db["routes"].append(route)
+    # Get customer from VPN
+    customer = next((c for c in db["customers"] if c["id"] == vpn["customer_id"]), None)
+    if not customer:
+        return jsonify({"success": False, "error": "Customer not found"}), 404
     
-    return jsonify({"success": True, "message": "Route created successfully", "data": route}), 201
+    instance_name = customer.get("name") or customer.get("instance_name")
+    
+    try:
+        # Add single route to OpenVPN instance
+        result = gacs_manager.add_route_for_vpn(
+            instance_name=instance_name,
+            route=data["destination"]
+        )
+        
+        # Store in-memory for UI tracking
+        global route_id_counter
+        route_id_counter += 1
+        route = {
+            "id": route_id_counter,
+            "vpn_id": vpn_id,
+            "vpn_name": vpn["name"],
+            "destination": data["destination"],
+            "gateway": data.get("gateway", ""),
+            "description": data.get("description", ""),
+            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+        db["routes"].append(route)
+        
+        return jsonify({
+            "success": True, 
+            "message": "Route added to VPN instance",
+            "data": {**result, "route_record": route}
+        }), 201
+        
+    except ValueError as e:
+        return jsonify({"success": False, "error": str(e)}), 404
+    except Exception as e:
+        return jsonify({"success": False, "error": f"Error adding route: {str(e)}"}), 500
 
 @app.route('/api/routes', methods=['GET'])
 def get_all_routes():
@@ -615,4 +684,4 @@ if __name__ == '__main__':
     print("     GET    /api/routes/<id>            - Get route detail")
     print("     DELETE /api/routes/<id>            - Delete route")
     print("=" * 60)
-    app.run(host='0.0.0.0', port=PORT, debug=False)
+    app.run(host=HOST, port=PORT, debug=False)
