@@ -1,25 +1,45 @@
-# Runtime & config (generated per-VPS)
-manager/config.conf
-manager/log.txt
-manager/nginx/
+```
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+.ENV
+.python-version
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
 
-# Instances (created at runtime)
-instances/
+# Build artifacts
+build/
+dist/
+*.egg-info/
+*.egg
 
-# GenieACS source (cloned via Services menu)
-source/stable/
-source/latest/
-
-# Optional external tooling (unused in tree)
-source/L2TP-Manager/
-
-# GACS-Ubuntu-22.04 (only keep parameter/ folder)
-source/GACS-Ubuntu-22.04/*
-!source/GACS-Ubuntu-22.04/parameter/
-
-# System
+# Logs
 *.log
+
+# Environment
+.env
+.env.local
+*.env.*
+
+# Editors
+.vscode/
+.idea/
 *.swp
 *.swo
-*~
+*.tmp
+
+# OS
 .DS_Store
+Thumbs.db
+
+# Coverage
+coverage/
+```
