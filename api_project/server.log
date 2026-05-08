@@ -1,0 +1,10 @@
+nohup: ignoring input
+==================================================
+🚀 Server API berjalan!
+📍 Akses Web UI: http://localhost:5000
+📍 API Base URL: http://localhost:5000/api
+==================================================
+ * Serving Flask app 'app'
+ * Debug mode: on
+Address already in use
+Port 5000 is in use by another program. Either identify and stop that program, or start the server with a different port.

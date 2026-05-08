@@ -1,9 +1,13 @@
+import os
 from flask import Flask, request, jsonify, render_template_string
 from flask_cors import CORS
 from datetime import datetime
 
 app = Flask(__name__)
 CORS(app)
+
+# Get port from environment variable or use default 5000
+PORT = int(os.environ.get('API_PORT', 8080))
 
 # In-memory database
 db = {
@@ -591,8 +595,8 @@ if __name__ == '__main__':
     print("=" * 60)
     print("🚀 VPN Management System API Server Started!")
     print("=" * 60)
-    print("📍 Web UI: http://localhost:5000")
-    print("📍 API Base: http://localhost:5000/api")
+    print(f"📍 Web UI: http://localhost:{PORT}")
+    print(f"📍 API Base: http://localhost:{PORT}/api")
     print("=" * 60)
     print("\n📋 Available Endpoints:")
     print("  👥 CUSTOMERS:")
@@ -611,4 +615,4 @@ if __name__ == '__main__':
     print("     GET    /api/routes/<id>            - Get route detail")
     print("     DELETE /api/routes/<id>            - Delete route")
     print("=" * 60)
-    app.run(host='0.0.0.0', port=5000, debug=False)
+    app.run(host='0.0.0.0', port=PORT, debug=False)
